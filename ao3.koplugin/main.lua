@@ -9,8 +9,10 @@ suite, since it all depends on real KOReader widgets.
 ]]
 
 local InfoMessage = require("ui/widget/infomessage")
+local InputDialog = require("ui/widget/inputdialog")
 local Menu = require("ui/widget/menu")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
+local TextViewer = require("ui/widget/textviewer")
 local NetworkMgr = require("ui/network/manager")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
@@ -120,9 +122,64 @@ function AO3Reader:logout()
 end
 
 --[[--
-Fetches a work listing and shows it as a Menu, tapping an entry just shows
-its AO3 URL for now (downloading isn't implemented yet -- see
-AO3Client:getDownloadUrl()). Shared by showMarkedForLater() and
+Formats one work's AO3-style details (rating/warnings/tags/summary/stats,
+same fields AO3's own listing pages show) as plain text for TextViewer.
+Every field but title/author/url is optional -- see parse_work_listing() in
+ao3client.lua -- and simply omitted here when a blurb didn't have it.
+
+@param work table  one entry from AO3Client's work listing/search results
+@return string
+]]
+local function formatWorkDetails(work)
+    local lines = { T(_("by %1"), work.author) }
+
+    local badges = {}
+    for _, value in ipairs({ work.rating, work.category, work.status }) do
+        if value then
+            table.insert(badges, value)
+        end
+    end
+    if #badges > 0 then
+        table.insert(lines, table.concat(badges, " · "))
+    end
+
+    if work.warnings and #work.warnings > 0 then
+        table.insert(lines, T(_("Warnings: %1"), table.concat(work.warnings, ", ")))
+    end
+
+    local stats = {}
+    if work.words then
+        table.insert(stats, T(_("%1 words"), work.words))
+    end
+    if work.chapters then
+        table.insert(stats, T(_("Chapters: %1"), work.chapters))
+    end
+    if #stats > 0 then
+        table.insert(lines, table.concat(stats, " · "))
+    end
+
+    if work.tags and #work.tags > 0 then
+        table.insert(lines, "")
+        table.insert(lines, T(_("Tags: %1"), table.concat(work.tags, ", ")))
+    end
+
+    if work.summary and work.summary ~= "" then
+        table.insert(lines, "")
+        table.insert(lines, work.summary)
+    end
+
+    table.insert(lines, "")
+    table.insert(lines, work.url)
+
+    return table.concat(lines, "\n")
+end
+
+--[[--
+Fetches a work listing and shows it as a Menu, tapping an entry shows its
+full AO3-style details (rating, warnings, tags, summary, word/chapter
+counts) in a scrollable TextViewer -- downloading isn't implemented yet
+(see AO3Client:getDownloadUrl()), the work's URL is included in that view
+as the closest substitute for now. Shared by showMarkedForLater() and
 showMyWorks(), which differ only in the fetch function, the loading
 message, and the screen title.
 
@@ -133,10 +190,14 @@ message, and the screen title.
 @param error_prefix string  prefixed to fetch_fn's error message, e.g.
   "Could not load Marked for Later"
 @param menu_title string  the resulting Menu widget's title
-@param fetch_fn function  self.ao3's own getter, e.g. AO3Client.getMyWorks
+@param fetch_fn function  called with self.ao3, returns (works, err) —
+  e.g. AO3Client.getMyWorks, or a closure over a search query
+@param requires_login boolean  true for account-only listings (Marked for
+  Later, My Works); false for AO3Client:search(), which is public and works
+  logged out too
 ]]
-function AO3Reader:showWorkListing(loading_text, empty_text, error_prefix, menu_title, fetch_fn)
-    if not self:isLoggedIn() then
+function AO3Reader:showWorkListing(loading_text, empty_text, error_prefix, menu_title, fetch_fn, requires_login)
+    if requires_login and not self:isLoggedIn() then
         UIManager:show(InfoMessage:new({ text = _("Log in to AO3 first.") }))
         return
     end
@@ -166,11 +227,11 @@ function AO3Reader:showWorkListing(loading_text, empty_text, error_prefix, menu_
             table.insert(item_table, {
                 text = work.title .. " — " .. work.author,
                 callback = function()
-                    -- Downloading isn't implemented yet (that's
-                    -- getDownloadUrl(), still a TODO) — showing the real
-                    -- URL here just confirms the data on screen is real,
-                    -- not placeholder text.
-                    UIManager:show(InfoMessage:new({ text = work.url }))
+                    UIManager:show(TextViewer:new({
+                        title = work.title,
+                        title_multilines = true,
+                        text = formatWorkDetails(work),
+                    }))
                 end,
             })
         end
@@ -188,7 +249,8 @@ function AO3Reader:showMarkedForLater()
         _("Nothing in Marked for Later."),
         _("Could not load Marked for Later"),
         _("Marked for Later"),
-        AO3Client.getMarkedForLater
+        AO3Client.getMarkedForLater,
+        true
     )
 end
 
@@ -198,7 +260,54 @@ function AO3Reader:showMyWorks()
         _("You haven't posted any works."),
         _("Could not load My Works"),
         _("My Works"),
-        AO3Client.getMyWorks
+        AO3Client.getMyWorks,
+        true
+    )
+end
+
+function AO3Reader:showSearchDialog()
+    local dialog
+    dialog = InputDialog:new({
+        title = _("Search AO3"),
+        input_hint = _("Title, tag, or free text"),
+        buttons = {
+            {
+                {
+                    text = _("Cancel"),
+                    id = "close",
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+                {
+                    text = _("Search"),
+                    is_enter_default = true,
+                    callback = function()
+                        local query = dialog:getInputText()
+                        UIManager:close(dialog)
+                        self:doSearch(query)
+                    end,
+                },
+            },
+        },
+    })
+    UIManager:show(dialog)
+    dialog:onShowKeyboard()
+end
+
+function AO3Reader:doSearch(query)
+    if not query or query == "" then
+        UIManager:show(InfoMessage:new({ text = _("Enter something to search for."), timeout = 2 }))
+        return
+    end
+
+    self:showWorkListing(
+        _("Searching AO3…"),
+        _("No results found."),
+        _("Search failed"),
+        T(_("AO3 search: %1"), query),
+        function(ao3) return ao3:search(query) end,
+        false
     )
 end
 
@@ -273,11 +382,7 @@ function AO3Reader:addToMainMenu(menu_items)
     menu_items.ao3_search = {
         text = _("Search AO3"),
         callback = function()
-            -- TODO: implemented once AO3Client:search() exists
-            UIManager:show(InfoMessage:new({
-                text = _("Search isn't built yet."),
-                timeout = 2,
-            }))
+            self:showSearchDialog()
         end,
     }
 end

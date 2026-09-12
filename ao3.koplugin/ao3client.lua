@@ -106,6 +106,36 @@ local function merge_cookies(headers, names, into)
 end
 
 --[[--
+True when `body` looks like AO3's login page rather than the page we asked
+for. Reuses the exact form field name (`user[login]`) login() itself
+submits credentials to, since that's already confirmed correct against the
+real site — not a new guess.
+
+A logged-in-only page can come back as this in more ways than a non-200
+status: AO3 may 302-redirect an expired/rejected session straight to
+/users/login, and some HTTP clients (including, as far as we've been able to
+tell, the one this plugin runs on) follow that redirect transparently and
+hand back a plain 200 with the login page's body — which, without this
+check, parse_work_listing() would just silently read as zero works, no error
+at all. That's indistinguishable on screen from a genuinely empty list,
+which is exactly the bug this guards against. login() itself also uses this,
+to confirm a session it just captured actually works before reporting
+success — see the comment there.
+
+Only call this against a page that's known to require a genuinely working
+session (like Marked for Later) or that IS the login page itself. A public,
+logged-out AO3 page also matches this pattern -- its header nav carries the
+same `user[login]` field in its own persistent mini login form -- which is
+why search() deliberately does not use this check (see there).
+
+@param body string?
+@return boolean
+]]
+local function looks_like_login_page(body)
+    return body ~= nil and body:find('name="user%[login%]"') ~= nil
+end
+
+--[[--
 Splits a listing page's body into one chunk per work, anchored on
 `id="work_<id>"` — confirmed, across several independent AO3 tools, to be
 how every work-listing page (search results, bookmarks, reading lists)
@@ -137,6 +167,107 @@ local function split_work_blurbs(body)
         table.insert(blurbs, { id = marker.id, html = body:sub(marker.start, chunk_end) })
     end
     return blurbs
+end
+
+--[[--
+Reads one of the four "required tags" badges every work blurb has (rating,
+archive-warning status, category, and complete/WIP status) -- confirmed
+against a real search-results page. Each is a `<span class="X-value Y"
+title="Human Readable Text">`, where Y (`class_suffix` here) is the fixed
+part identifying which badge it is (e.g. "rating", "category", "iswip") and
+the human-readable text AO3 itself displays is right there in `title` --
+no need to decode AO3's own short internal value codes (e.g. "general
+audience") at all.
+
+@param html string  one work's blurb HTML
+@param class_suffix string  "rating", "category", or "iswip"
+@return string?
+]]
+local function extract_badge(html, class_suffix)
+    return html:match('class="[%w%-]+ ' .. class_suffix .. '"%s+title="([^"]+)"')
+end
+
+--[[--
+Collects every tag AO3 links to `/tags/...` within a specific `<li
+class='NAME'>...</li>` grouping in a blurb's "Tags" section (e.g.
+class_name="warnings" for archive warnings, "freeforms" for freeform tags).
+Confirmed against a real blurb: AO3 renders one such `<li>` per tag, not one
+`<li>` holding a comma-joined list, so multiple warnings/etc. need this to
+gmatch across all of them, the same shape split_work_blurbs()'s sibling
+helper extract_all_tags() below handles for the whole "Tags" list at once.
+
+@param html string  one work's blurb HTML
+@param class_name string  e.g. "warnings", "characters", "relationships"
+@return string[]
+]]
+local function extract_tag_group(html, class_name)
+    local tags = {}
+    for li in html:gmatch("<li class='" .. class_name .. "'>(.-)</li>") do
+        local text = li:match('class="tag"[^>]*>([^<]+)</a>')
+        if text then
+            table.insert(tags, html_unescape(text))
+        end
+    end
+    return tags
+end
+
+--[[--
+Collects every tag in a blurb's whole "Tags" section (warnings, characters,
+relationships, and freeform tags together, in the order AO3 lists them) --
+everything inside the single `<ul class="tags commas">...</ul>` block.
+Deliberately bounded to that block, not just "every `class=\"tag\"` link in
+the blurb": the fandom heading above it (`<h5 class="fandoms heading">`) has
+its own separate `class="tag"` links that this must not also pick up.
+
+@param html string  one work's blurb HTML
+@return string[]
+]]
+local function extract_all_tags(html)
+    local list_html = html:match('<ul class="tags commas">(.-)</ul>')
+    if not list_html then
+        return {}
+    end
+    local tags = {}
+    for text in list_html:gmatch('class="tag"[^>]*>([^<]+)</a>') do
+        table.insert(tags, html_unescape(text))
+    end
+    return tags
+end
+
+--[[--
+Reads one `<dd class="NAME">...</dd>` value out of a blurb's stats block
+(words, chapters, etc.), with any inner tags stripped -- confirmed against a
+real blurb, "chapters" sometimes wraps its number in a link (to the latest
+chapter) while a plain one-shot's doesn't, so this always strips tags rather
+than assuming either shape.
+
+@param html string  one work's blurb HTML
+@param class_name string  e.g. "words", "chapters"
+@return string?
+]]
+local function extract_stat(html, class_name)
+    local raw = html:match('<dd class="' .. class_name .. '"[^>]*>(.-)</dd>')
+    return raw and (raw:gsub("<[^>]+>", ""))
+end
+
+--[[--
+Turns a summary blockquote's inner HTML into plain text. AO3 summaries are
+free-form rich text an author wrote (paragraphs, the occasional bold/italic
+or link), not structured data, so this isn't a general HTML-to-text
+converter -- it only needs to be good enough for that: paragraph/line breaks
+become actual newlines so multi-paragraph summaries don't run together into
+one block, every other tag is dropped, and HTML entities are decoded.
+
+@param html string  the blockquote's inner HTML (without the tag itself)
+@return string
+]]
+local function strip_summary_html(html)
+    local text = html:gsub("<br%s*/?>", "\n"):gsub("</p>", "\n\n"):gsub("<[^>]+>", "")
+    text = html_unescape(text)
+    text = text:gsub("[ \t]+", " ")
+    text = text:gsub(" ?\n ?", "\n")
+    text = text:gsub("\n\n+", "\n\n")
+    return (text:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
 --[[--
@@ -251,6 +382,23 @@ function AO3Client:login(username, password)
     -- can send them straight back, the way a real browser would.
     merge_cookies(page_headers, EXTRA_COOKIE_NAMES, self.extra_cookies)
 
+    -- Rails' default cookie-based session store keeps the CSRF secret
+    -- *inside* the session cookie itself, not server-side -- so the
+    -- anonymous session this very GET just established has to be sent back
+    -- on the POST below for the submitted authenticity_token to validate at
+    -- all. Confirmed missing this makes AO3 redirect to /auth_error
+    -- ("Session Expired") regardless of whether the credentials are correct
+    -- -- found by replicating this exact two-request flow with curl against
+    -- the real site (a controlled A/B: identical request, only this cookie
+    -- present or absent), not by guessing. This is deliberately kept local
+    -- rather than folded into self.extra_cookies/buildCookieHeader(): it's
+    -- only ever relevant for the one POST immediately below, and self
+    -- shouldn't hold a stale pre-login session value once a real one (or a
+    -- rejection) is known a few lines later.
+    local pre_login_cookie = page_headers and page_headers["set-cookie"]
+    local pre_login_session = pre_login_cookie
+        and pre_login_cookie:match(SESSION_COOKIE_NAME .. "=([^;,]+)")
+
     -- AO3 (a Rails app) exposes the CSRF token as a <meta> tag on every page.
     local csrf_token = page_body and page_body:match('name="csrf%-token" content="([^"]+)"')
     if not csrf_token then
@@ -263,13 +411,23 @@ function AO3Client:login(username, password)
         LOGIN_FIELD_PASSWORD .. "=" .. url_encode(password),
     }, "&")
 
+    local post_cookie_parts = {}
+    if pre_login_session then
+        table.insert(post_cookie_parts, SESSION_COOKIE_NAME .. "=" .. pre_login_session)
+    end
+    local cloudflare_cookie_header = self:buildCookieHeader()
+    if cloudflare_cookie_header then
+        table.insert(post_cookie_parts, cloudflare_cookie_header)
+    end
+    local post_cookie_header = #post_cookie_parts > 0 and table.concat(post_cookie_parts, "; ") or nil
+
     local post_ok, post_status, post_headers = self.http_request({
         url = LOGIN_URL,
         method = "POST",
         headers = {
             ["Content-Type"] = "application/x-www-form-urlencoded",
             ["Content-Length"] = tostring(#body),
-            Cookie = self:buildCookieHeader(),
+            Cookie = post_cookie_header,
         },
         body = body,
     })
@@ -292,9 +450,26 @@ function AO3Client:login(username, password)
         return false, "login rejected — check username/password"
     end
     local location = post_headers and (post_headers["location"] or post_headers["Location"])
-    if location and location:find("/users/login", 1, true) then
+    if location and (location:find("/users/login", 1, true) or location:find("/auth_error", 1, true)) then
+        -- /auth_error ("Session Expired") is a distinct redirect target from
+        -- /users/login -- confirmed against the real site -- that Warden's
+        -- own failure handling uses for a CSRF/session-level rejection
+        -- (happening before Devise even looks at the credentials), as
+        -- opposed to Devise's own "wrong password" rejection which goes
+        -- back to /users/login. The pre-login cookie fix above should mean
+        -- this is never hit in practice now, but treating it as anything
+        -- other than a rejection would be wrong regardless.
         return false, "login rejected — check username/password"
     end
+
+    -- AO3's login field accepts either an account's username or its email
+    -- (confirmed: it's the same Devise `user[login]` field either way) --
+    -- but only the username is a valid URL segment. The redirect target
+    -- above already names AO3's own canonical username for this account, so
+    -- prefer that over whatever was actually typed into the login form for
+    -- anything URL-related below; falling back to the typed value only if
+    -- the redirect didn't have the expected shape.
+    local canonical_username = (location and location:match("/users/([^/]+)")) or username
 
     -- LuaSocket folds repeated response headers (like multiple Set-Cookie
     -- lines) into one comma-joined string, which mangles cookie expiry dates
@@ -312,8 +487,36 @@ function AO3Client:login(username, password)
         return false, "login looked successful but no session cookie came back"
     end
 
+    -- Don't just trust the redirect-target heuristic above: that's exactly
+    -- what the Cloudflare cookie bug in CLAUDE.md looked like too (login()
+    -- said "success", but the saved session didn't actually work for the
+    -- very next request). Confirm the cookies captured so far genuinely
+    -- authenticate before telling the caller login succeeded, by fetching
+    -- an account-only page a logged-out (or wrongly-authenticated) client
+    -- can never see. "Marked for Later" is used here specifically because
+    -- it's confirmed, from direct testing against the real site, to require
+    -- a genuinely working session -- unlike e.g. a user's public profile or
+    -- "My Works" page, which anyone can view logged out.
     self.session_cookie = SESSION_COOKIE_NAME .. "=" .. session_value
-    self.username = username
+    local verify_ok, verify_status, verify_headers, verify_body = self.http_request({
+        url = BASE_URL .. "/users/" .. url_encode(canonical_username) .. "/readings?show=to-read",
+        method = "GET",
+        headers = { Cookie = self:buildCookieHeader() },
+    })
+    if verify_ok then
+        merge_cookies(verify_headers, EXTRA_COOKIE_NAMES, self.extra_cookies)
+    end
+    if not verify_ok then
+        self.session_cookie = nil
+        return false, "login looked successful but verifying it failed (" .. tostring(verify_status) .. ")"
+    end
+    if verify_status ~= 200 or looks_like_login_page(verify_body) then
+        self.session_cookie = nil
+        return false, "login looked successful but the saved session doesn't actually work "
+            .. "(verification got status " .. tostring(verify_status) .. ") — try again"
+    end
+
+    self.username = canonical_username
     return true
 end
 
@@ -326,7 +529,10 @@ no author link is just AO3 omitting "by yourself" — it's still you).
 
 @param body string  the page's HTML
 @param fallback_author string  used when a blurb has no `rel="author"` link
-@return table[] works  list of { id, title, author, url }
+@return table[] works  list of { id, title, author, url, rating, category,
+  status, warnings, tags, words, chapters, summary } -- every field past
+  `url` is nil/empty if the expected markup wasn't found in that blurb,
+  rather than failing the whole entry (see below)
 ]]
 local function parse_work_listing(body, fallback_author)
     local works = {}
@@ -341,11 +547,28 @@ local function parse_work_listing(body, fallback_author)
                 table.insert(authors, html_unescape(author))
             end
 
+            -- Summary is genuinely optional (very short blurbs, or a work
+            -- whose author didn't write one, have no "Summary" block at
+            -- all) -- unlike title, its absence isn't a sign the whole
+            -- blurb didn't parse, so it's not covered by the "skipped
+            -- entirely" comment below.
+            local summary_html = blurb.html:match('<blockquote class="userstuff summary">(.-)</blockquote>')
+
+            local words = extract_stat(blurb.html, "words")
+
             table.insert(works, {
                 id = blurb.id,
                 title = html_unescape(title),
                 author = #authors > 0 and table.concat(authors, ", ") or fallback_author,
                 url = BASE_URL .. "/works/" .. blurb.id,
+                rating = extract_badge(blurb.html, "rating"),
+                category = extract_badge(blurb.html, "category"),
+                status = extract_badge(blurb.html, "iswip"),
+                warnings = extract_tag_group(blurb.html, "warnings"),
+                tags = extract_all_tags(blurb.html),
+                words = words and tonumber((words:gsub(",", ""))),
+                chapters = extract_stat(blurb.html, "chapters"),
+                summary = summary_html and strip_summary_html(summary_html),
             })
         end
         -- A blurb whose title we couldn't find is silently skipped rather
@@ -353,28 +576,6 @@ local function parse_work_listing(body, fallback_author)
         -- none, if AO3's markup has a variant we didn't account for.
     end
     return works
-end
-
---[[--
-True when `body` looks like AO3's login page rather than the listing page we
-asked for. Reuses the exact form field name (`user[login]`) login() itself
-submits credentials to, since that's already confirmed correct against the
-real site — not a new guess.
-
-A logged-in-only page can come back as this in more ways than a non-200
-status: AO3 may 302-redirect an expired/rejected session straight to
-/users/login, and some HTTP clients (including, as far as we've been able to
-tell, the one this plugin runs on) follow that redirect transparently and
-hand back a plain 200 with the login page's body — which, without this
-check, parse_work_listing() would just silently read as zero works, no error
-at all. That's indistinguishable on screen from a genuinely empty list,
-which is exactly the bug this guards against.
-
-@param body string?
-@return boolean
-]]
-local function looks_like_login_page(body)
-    return body ~= nil and body:find('name="user%[login%]"') ~= nil
 end
 
 --[[--
@@ -452,13 +653,46 @@ function AO3Client:getMyWorks()
     )
 end
 
---- Searches AO3 works by free-text query.
--- @param query string
--- @return table[]? works
--- @return string? err
+--[[--
+Searches AO3 works by free-text query (the same request AO3's own "Search
+Works" box makes: GET /works/search?work_search[query]=...). Public --
+works whether or not login() has succeeded.
+
+Deliberately does NOT reuse fetchWorkListing()/looks_like_login_page(): a
+logged-out AO3 page always carries a "log in" mini-form in its own header
+nav using the exact same `user[login]` field name looks_like_login_page()
+checks for, so applying that check here would misread every real,
+logged-out search result page as an expired session -- confirmed by
+fetching a real one directly (see CLAUDE.md). A non-200 status is still a
+real error; a 200 with zero matching blurbs is just zero results, same as
+the other listing getters.
+
+Only reads page 1 — AO3 paginates search results too, same as
+getMarkedForLater()/getMyWorks() (see CLAUDE.md).
+
+@param query string  free-text search query
+@return table[]? works  list of { id, title, author, url }
+@return string? err
+]]
 function AO3Client:search(query)
-    -- TODO: GET BASE_URL .. "/works/search?work_search[query]=" .. query
-    error("not implemented yet")
+    if not query or query == "" then
+        return nil, "search query is required"
+    end
+
+    local ok, status, headers, body = self.http_request({
+        url = BASE_URL .. "/works/search?work_search[query]=" .. url_encode(query),
+        method = "GET",
+        headers = { Cookie = self:buildCookieHeader() },
+    })
+    if not ok then
+        return nil, "could not reach AO3 (" .. tostring(status) .. ")"
+    end
+    merge_cookies(headers, EXTRA_COOKIE_NAMES, self.extra_cookies)
+    if status ~= 200 then
+        return nil, "unexpected response (" .. tostring(status) .. ") searching AO3"
+    end
+
+    return parse_work_listing(body, "Anonymous")
 end
 
 --- Returns the direct download URL AO3 generates for a work.

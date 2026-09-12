@@ -5,3 +5,7 @@ Thumbs.db
 # Lua tooling
 lua_modules/
 luacov.*.out
+
+# Agent dev tooling (emulator launch/debug skill) -- kept local,
+# deliberately not part of the plugin's own history
+.claude/
