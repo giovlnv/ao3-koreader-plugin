@@ -214,9 +214,19 @@ function AO3Client:login(username, password)
         return false, "login request failed (" .. tostring(post_status) .. ")"
     end
 
-    -- AO3 redirects (302/303) on a successful login, and re-renders the
-    -- login form (200, with an error message in the body) on bad credentials.
+    -- AO3 redirects (302/303) on BOTH a successful login and a rejected one
+    -- -- confirmed against AO3's own source: it's plain Devise underneath,
+    -- and Devise's stock failure handling also 302s, back to the login page
+    -- itself. The status code alone can't tell the two apart; the redirect
+    -- *target* can: success goes to /users/<username> (or a preserved deep
+    -- link), failure goes back to /users/login. (A previous version of this
+    -- function only checked the status code, which meant a wrong password
+    -- was misread as a successful login -- see CLAUDE.md.)
     if post_status ~= 302 and post_status ~= 303 then
+        return false, "login rejected — check username/password"
+    end
+    local location = post_headers and (post_headers["location"] or post_headers["Location"])
+    if location and location:find("/users/login", 1, true) then
         return false, "login rejected — check username/password"
     end
 
@@ -224,6 +234,12 @@ function AO3Client:login(username, password)
     -- lines) into one comma-joined string, which mangles cookie expiry dates
     -- (they contain commas too). Rather than trying to parse that properly,
     -- just pull out the one cookie value we actually need.
+    --
+    -- Note this cookie alone can't be trusted as a success signal either --
+    -- AO3 sets/rotates it on essentially every response, failed logins
+    -- included, since flash messages and CSRF tokens both touch the Rails
+    -- session. The location check above is what actually decides success;
+    -- this just extracts the value once we already know it succeeded.
     local set_cookie = post_headers and post_headers["set-cookie"]
     local session_value = set_cookie and set_cookie:match(SESSION_COOKIE_NAME .. "=([^;,]+)")
     if not session_value then

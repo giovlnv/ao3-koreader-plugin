@@ -217,12 +217,15 @@ function AO3Reader:addToMainMenu(menu_items)
     -- The items below are what menu_setup.lua's TAB_ITEM_IDS lists as
     -- belonging to the "ao3reader" tab -- flat, top-level entries here
     -- (like "read_timer"/"calibre"/etc. under the built-in "tools" tab),
-    -- not nested under menu_items.ao3reader itself.
+    -- not nested under menu_items.ao3reader itself. "My Works" is the one
+    -- exception: it lives inside the account item's own submenu instead
+    -- (see below) since it's specifically about the logged-in account, not
+    -- a peer of "Marked for Later"/"Search AO3".
     menu_items.ao3_account = {
         -- One item does both jobs, switching on login state: logged out,
         -- it reads "Public" and tapping opens a one-item submenu ("Log in
         -- to AO3"); logged in, it shows the username instead and tapping
-        -- opens a one-item submenu ("Log out"). text_func/
+        -- opens a submenu with "My Works" above "Log out". text_func/
         -- sub_item_table_func are re-evaluated on every tap (see
         -- KOReader's touchmenu.lua onMenuSelect), which is what makes this
         -- track login state instead of needing the menu rebuilt.
@@ -235,6 +238,12 @@ function AO3Reader:addToMainMenu(menu_items)
         sub_item_table_func = function()
             if self:isLoggedIn() then
                 return {
+                    {
+                        text = _("My Works"),
+                        callback = function()
+                            self:showMyWorks()
+                        end,
+                    },
                     {
                         text = _("Log out"),
                         callback = function()
@@ -258,13 +267,6 @@ function AO3Reader:addToMainMenu(menu_items)
         text = _("Marked for Later"),
         callback = function()
             self:showMarkedForLater()
-        end,
-    }
-
-    menu_items.ao3_my_works = {
-        text = _("My Works"),
-        callback = function()
-            self:showMyWorks()
         end,
     }
 

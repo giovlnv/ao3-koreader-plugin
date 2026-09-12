@@ -136,10 +136,16 @@ Design notes on the UI layer:
   KOReader's `touchmenu.lua` on every tap, which is what makes this track
   login state without needing the menu rebuilt): logged out it reads
   "Public" and tapping opens a one-item submenu ("Log in to AO3"); logged
-  in it shows the username and tapping opens a one-item submenu ("Log
-  out"). Both states are genuine submenus (`sub_item_table_func` never
-  returns `nil`), which avoids a submenu-arrow-always-shows cosmetic quirk
-  an earlier version of this had.
+  in it shows the username and tapping opens a two-item submenu, "My
+  Works" above "Log out". Both states are genuine submenus
+  (`sub_item_table_func` never returns `nil`), which avoids a
+  submenu-arrow-always-shows cosmetic quirk an earlier version of this had.
+  "My Works" moved here (it was briefly a flat top-level item, a sibling of
+  "Marked for Later"/"Search AO3") because it's specifically about the
+  logged-in account, not a peer of the other two — `menu_setup.lua`'s
+  `TAB_ITEM_IDS` dropped `"ao3_my_works"` to match; see "AO3 Reader's own
+  menu tab" below for how an already-installed tab picks up an item-list
+  change like this one without the user having to do anything.
 - None of `main.lua` (or `menu_setup.lua`) is covered by the busted suite —
   both depend on real KOReader (widgets that only exist inside a running
   KOReader; `DataStorage`, the settings directory, and the real menu-order
@@ -173,15 +179,17 @@ assumed:
   — and merges any keys it finds on top. This is a real, documented
   KOReader customization point (not a hack), but the files are
   KOReader-wide, not private to this plugin.
-- `menu_setup.lua`'s `ensureTabInstalled()` writes to both of those files,
-  once: it reads whatever's there already (or KOReader's own built-in
-  default, if nothing's been customized yet), appends `"ao3reader"` to the
-  tab row, adds `["ao3reader"] = {"ao3_account", "ao3_marked_for_later",
-  "ao3_my_works", "ao3_search"}`, and writes the merged result back. It
-  never touches any other key already in the file, and does nothing at all
-  once `["ao3reader"]` is already present — so a normal restart doesn't
-  keep rewriting these files, and any later hand-edits to them (reordering
-  our tab's items, say) stick.
+- `menu_setup.lua`'s `ensureTabInstalled()` writes to both of those files:
+  it reads whatever's there already (or KOReader's own built-in default, if
+  nothing's been customized yet), appends `"ao3reader"` to the tab row if
+  it's not there yet, and sets `["ao3reader"]` to `TAB_ITEM_IDS`
+  (`{"ao3_account", "ao3_marked_for_later", "ao3_search"}` as of this
+  session), writing the merged result back. It never touches any other key
+  already in the file. It skips the write entirely once both the tab row
+  and `["ao3reader"]`'s item list already match — see the "no longer
+  treats the whole tab as install-once" note further down for why the item
+  list specifically stays synced instead of being frozen forever like the
+  original version of this did.
 - A new tab also needs an icon: `ui/widget/iconwidget.lua` checks
   `DataStorage:getDataDir() .. "/icons"` for a same-named `.svg`/`.png`
   before falling back to KOReader's own bundled set. `ensureIconInstalled()`
@@ -195,15 +203,65 @@ assumed:
   re-copies it.
 - `menu_items.ao3reader` itself is now the tab (`{icon = "ao3"}`, no text —
   exactly how `readermenu.lua`'s own `tools`/`search`/`setting` entries are
-  defined), and `ao3_account`/`ao3_marked_for_later`/`ao3_my_works`/
-  `ao3_search` are flat sibling items under it, the same way `read_timer`/
-  `calibre`/etc. sit flat under the built-in `tools` tab — not nested
-  inside `menu_items.ao3reader` itself.
+  defined), and `ao3_account`/`ao3_marked_for_later`/`ao3_search` are flat
+  sibling items under it, the same way `read_timer`/`calibre`/etc. sit flat
+  under the built-in `tools` tab — not nested inside `menu_items.ao3reader`
+  itself. `ao3_my_works` is deliberately not one of these three: "My Works"
+  now lives inside the account item's own submenu instead (see the Status
+  section above) since it's about the logged-in account specifically, not
+  a peer of "Marked for Later"/"Search AO3".
 - The new tab lands last (rightmost, after "main") in both menus, since
   `ensureTabInstalled()` just appends to whatever tab row it finds. Not
   tried yet on-device, so unconfirmed whether that's actually the best
   spot — easy to change later (either re-order by hand in the settings
   files, or ask to change where `patchOrderFile()` inserts `"ao3reader"`).
+- `patchOrderFile()` no longer treats the whole tab as "installed, never
+  touch again" once `existing[TAB_ID]` exists. It still only ever *adds*
+  `"ao3reader"` to the shared tab row and never reorders or touches any
+  other tab there — that part hasn't changed. But the item list *inside*
+  our own tab (`existing[TAB_ID]` itself) is now kept in sync with
+  `TAB_ITEM_IDS` on every call (a plain list-equality check decides whether
+  a rewrite is needed at all, so a normal restart still doesn't rewrite the
+  file every time). This changed because it had to: this plugin's own item
+  list already changed once during development (dropping `"ao3_my_works"`
+  when it moved into the account submenu — see below), and without this,
+  an already-installed tab on a device that had run an earlier version
+  would keep pointing at a `menu_items` key that no longer exists. Nothing
+  else in either settings file is touched by this.
+
+## Fixed: wrong credentials were read as a successful login
+
+Second live-test finding: logging in with a wrong username/password still
+showed as logged in (username shown in the account menu instead of
+"Public"), and then behaved strangely on "Marked for Later" (since it was
+never really authenticated, whatever `login()` handed it as a session
+cookie wasn't a working one).
+
+Root cause, confirmed against AO3's own source (`otwcode/otwarchive` is
+plain Devise underneath `Users::SessionsController`, not custom auth):
+`login()`'s check —"302/303 means success, 200 means failure"— was wrong.
+**AO3 redirects (302) on a rejected login too** — Devise's stock failure
+handling 302s straight back to `/users/login` with a flash error, it
+doesn't re-render the form inline. And the `_otwarchive_session` cookie
+gets set/rotated on that redirect regardless of whether the login actually
+succeeded, since flash messages and the CSRF token both touch the Rails
+session on every request. So a wrong password produced exactly the same
+`(302, has a session cookie)` shape `login()` was treating as proof of
+success.
+
+The part that actually differs is the redirect *target*: success goes to
+`/users/<username>` (or a preserved deep link), failure goes back to
+`/users/login`. Fix: `login()` now also checks the POST response's
+`Location` header and rejects the login if it points back at
+`/users/login`, before ever looking at the cookie. Two things changed in
+the tests (`spec/ao3client_spec.lua`): the existing "logs in" test now
+includes a realistic `Location: .../users/someuser` header, and a new test
+asserts rejection when `Location` points back at `/users/login` despite a
+302 status and a cookie being present — the exact shape of the original bug.
+
+Not independently re-verified against a live wrong-password attempt yet
+(same caveat as everything else in this section) — next session's
+checklist below covers it.
 
 ## Known issue: login/list requests could hang the whole UI (mitigated)
 
@@ -340,3 +398,11 @@ caveat:
 - Re-test "Marked for Later" and "My Works" now that the login-page
   detection and User-Agent header are in — see "First live test" above for
   what to look for in whatever error (if any) comes back this time.
+- Try logging in with a deliberately wrong password: should now show an
+  error and leave the account menu reading "Public", not the username —
+  see "Fixed: wrong credentials were read as a successful login" above.
+- Confirm the account submenu now shows "My Works" above "Log out" when
+  logged in, and that the top-level tab only has three flat items (account,
+  Marked for Later, Search AO3) — if a device already had the tab installed
+  from an earlier session, this also confirms `patchOrderFile()`'s
+  item-list sync actually took effect, not just a fresh install.

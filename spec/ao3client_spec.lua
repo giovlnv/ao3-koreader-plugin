@@ -54,10 +54,17 @@ describe("AO3Client#login", function()
         assert.is_not_nil(err)
     end)
 
-    it("logs in given a CSRF token and a redirect response", function()
+    it("logs in given a CSRF token and a redirect to the user\'s own page", function()
         local client = AO3Client.new(fake_http({
             { ok = 1, status = 200, headers = {}, body = '<meta name="csrf-token" content="tok123">' },
-            { ok = 1, status = 302, headers = { ["set-cookie"] = "_otwarchive_session=abc123; path=/; HttpOnly" } },
+            {
+                ok = 1,
+                status = 302,
+                headers = {
+                    ["location"] = "https://archiveofourown.org/users/someuser",
+                    ["set-cookie"] = "_otwarchive_session=abc123; path=/; HttpOnly",
+                },
+            },
         }))
 
         local ok, err = client:login("someuser", "somepass")
@@ -65,6 +72,34 @@ describe("AO3Client#login", function()
         assert.is_true(ok)
         assert.is_nil(err)
         assert.are.equal("_otwarchive_session=abc123", client.session_cookie)
+    end)
+
+    it("rejects a login that redirects back to the login page despite a 302 and a cookie", function()
+        -- The actual shape of a wrong password on AO3: Devise's stock
+        -- failure handling redirects (302), and the session cookie gets
+        -- re-emitted anyway (flash message + CSRF both touch the Rails
+        -- session) -- so status and cookie presence alone both look exactly
+        -- like a successful login. Only the redirect target (back to
+        -- /users/login, instead of /users/<username>) actually tells them
+        -- apart. Regression check for the bug where wrong credentials were
+        -- read as a successful login.
+        local client = AO3Client.new(fake_http({
+            { ok = 1, status = 200, headers = {}, body = '<meta name="csrf-token" content="tok123">' },
+            {
+                ok = 1,
+                status = 302,
+                headers = {
+                    ["location"] = "https://archiveofourown.org/users/login",
+                    ["set-cookie"] = "_otwarchive_session=deadbeef; path=/; HttpOnly",
+                },
+            },
+        }))
+
+        local ok, err = client:login("someuser", "wrongpass")
+
+        assert.is_false(ok)
+        assert.is_not_nil(err)
+        assert.is_nil(client.session_cookie)
     end)
 
     it("still finds the session cookie among other comma-joined cookies", function()

@@ -17,12 +17,15 @@ conservative:
   "<config_prefix>_menu_order.lua" in the settings directory, merging
   whatever keys it finds on top of the built-in defaults). This is a real,
   supported KOReader customization point, not a hack -- but the file is
-  KOReader-wide, so this only ever ADDS our own tab id and never touches or
-  resets anything else already in it, and does nothing at all once it
-  detects its own change is already there (so a normal KOReader restart
-  doesn't rewrite these files every time, and any manual edits the user
-  makes to them afterwards -- reordering items within our tab, for
-  instance -- are left alone for good).
+  KOReader-wide, so this only ever ADDS our own tab id to the shared tab
+  row, never touches or reorders anything else already there, and does
+  nothing at all to that row once our tab id is already present.
+  The item list *inside* our own tab (existing[TAB_ID]) is different: it's
+  kept in sync with TAB_ITEM_IDS below on every call, since nothing but this
+  plugin has a reason to touch it, and this plugin's own item list has
+  already changed once during development -- see patchOrderFile()'s own
+  comment for why "sync our part, never touch anyone else's" is the actual
+  rule here, not "write once and never again".
 
 None of this is covered by the busted suite -- like main.lua, it depends on
 a real KOReader environment (DataStorage, the settings directory, the real
@@ -44,7 +47,7 @@ local MenuSetup = {}
 local ORDER_CONFIG_PREFIXES = { "reader", "filemanager" }
 
 local TAB_ID = "ao3reader"
-local TAB_ITEM_IDS = { "ao3_account", "ao3_marked_for_later", "ao3_my_works", "ao3_search" }
+local TAB_ITEM_IDS = { "ao3_account", "ao3_marked_for_later", "ao3_search" }
 local ICON_NAME = "ao3"
 
 --[[--
@@ -118,9 +121,34 @@ local function serializeOrderTable(t)
     return table.concat(lines, "\n")
 end
 
---- Adds TAB_ID to one menu's order override file, if it isn't there
--- already. See the module comment for why this only ever adds to, and
--- never rewrites, anything else already in the file.
+local function lists_equal(a, b)
+    if #a ~= #b then
+        return false
+    end
+    for i = 1, #a do
+        if a[i] ~= b[i] then
+            return false
+        end
+    end
+    return true
+end
+
+--[[--
+Adds TAB_ID to one menu's order override file (only ever adding it to the
+tab row, never touching any other tab's presence or order there), and keeps
+our own tab's item list (existing[TAB_ID]) in sync with TAB_ITEM_IDS above.
+
+That second part is a deliberate departure from "never touch it again":
+unlike the tab row itself (a real, user-editable customization point other
+plugins and hand-edits also share), the item list under our own TAB_ID is
+private to this plugin -- nothing else has a reason to edit it -- so keeping
+it synced with the code is safe, and necessary: this plugin's own menu items
+have already changed once during development (see CLAUDE.md), and a stale
+item list here would mean an already-installed tab silently pointing at a
+menu_items key that no longer exists. Writes are still skipped entirely
+once both the tab row and the item list already match what this call would
+produce, so a normal restart still doesn't keep rewriting these files.
+]]
 local function patchOrderFile(config_prefix)
     local path = DataStorage:getSettingsDir() .. "/" .. config_prefix .. "_menu_order.lua"
 
@@ -137,19 +165,19 @@ local function patchOrderFile(config_prefix)
         end
     end
 
-    if existing[TAB_ID] ~= nil then
-        return -- our tab is already installed here
-    end
-
     -- Start from whatever the user (or an earlier plugin) already put in
     -- this file's tab row, if anything; otherwise fall back to KOReader's
     -- own built-in default for this menu, the same table readermenu.lua/
     -- filemanagermenu.lua would use if this override file didn't exist.
     local buttons = existing["KOMenu:menu_buttons"]
+    local tab_already_present = false
     if buttons then
         local copy = {}
         for _, id in ipairs(buttons) do
             table.insert(copy, id)
+            if id == TAB_ID then
+                tab_already_present = true
+            end
         end
         buttons = copy
     else
@@ -160,14 +188,13 @@ local function patchOrderFile(config_prefix)
         end
     end
 
-    local already_present = false
-    for _, id in ipairs(buttons) do
-        if id == TAB_ID then
-            already_present = true
-        end
-    end
-    if not already_present then
+    if not tab_already_present then
         table.insert(buttons, TAB_ID)
+    end
+
+    local items_already_current = type(existing[TAB_ID]) == "table" and lists_equal(existing[TAB_ID], TAB_ITEM_IDS)
+    if tab_already_present and items_already_current then
+        return -- nothing to do; already installed with the current item list
     end
 
     existing["KOMenu:menu_buttons"] = buttons
