@@ -71,11 +71,13 @@ real archiveofourown.org** (verified with `scripts/smoke_test_login.lua`).
 The field names documented in `ao3client.lua` are correct as of this check.
 
 `getMarkedForLater()` and `getMyWorks()` (AO3's "My Works" page — every work
-the logged-in user has posted themselves) are implemented and unit-tested
-(11 tests between them, all mocked) but **neither is yet verified against
-the real site** — unlike login, their HTML parsing was designed from
-secondary sources (other AO3 tools' selectors), not from directly
-inspecting real pages' markup. They share almost all of their code
+the logged-in user has posted themselves) are implemented, unit-tested, and
+**confirmed working against the real archiveofourown.org** — both now
+return real parsed results on-device, after fixing the Cloudflare
+cookie-handling bug described below. Their HTML parsing was originally
+designed from secondary sources (other AO3 tools' selectors), not from
+directly inspecting real pages' markup, but the live test raised no sign of
+a parsing mismatch. They share almost all of their code
 (`fetchWorkListing()` + `parse_work_listing()`; the only difference is the
 URL and what an author-less blurb falls back to — "Anonymous" for Marked
 for Later, the logged-in username for My Works, since AO3 just doesn't
@@ -87,10 +89,11 @@ whoever picks this up:
   `ssl.https` + `ltn12`) is only `require`d lazily, so running the tests
   doesn't need LuaSec installed at all.
 - Cookie extraction deliberately doesn't do general cookie parsing: it
-  pattern-matches for `_otwarchive_session=...` specifically, to sidestep a
-  known LuaSocket gotcha where repeated `Set-Cookie` headers get
-  comma-joined and cookie expiry dates (which contain commas) mangle the
-  result.
+  pattern-matches for specific cookie names (`_otwarchive_session`, plus
+  Cloudflare's `__cf_bm`/`_cfuvid` — see "Fixed: Cloudflare's bot-management
+  cookies were dropped" below) one at a time, to sidestep a known LuaSocket
+  gotcha where repeated `Set-Cookie` headers get comma-joined and cookie
+  expiry dates (which contain commas) mangle the result.
 - There's no HTML/DOM library available to a plain KOReader Lua plugin, so
   parsing is done with plain string patterns. `split_work_blurbs()` anchors
   on `id="work_<id>" class="...blurb..."`, which several independent AO3
@@ -343,19 +346,12 @@ published works). Results:
     blocking on sites like this — a plausible independent contributor to
     getting served something other than the real page. Genuinely honest,
     not a browser-impersonation string.
-  - **Still not fully confirmed**: this is the best-supported explanation
-    given what the real source says the markup should be, but nobody has
-    actually seen the raw response AO3 sent back that day. If "Marked for
-    Later" still comes back empty after this fix, the new error message
-    itself is the next diagnostic signal — if it now says "session has
-    likely expired", the login-page theory was right and the real question
-    becomes *why* the session was being rejected for this endpoint
-    specifically (cookie scope? an additional cookie AO3 also expects?); if
-    it goes back to silently saying "Nothing in Marked for Later" with a
-    real entry existing, this fix didn't address the actual cause and the
-    next step is capturing the raw response body for a real look (e.g.
-    temporarily have `showWorkListing()` show `err` or a body snippet in the
-    `InfoMessage` instead of swallowing it).
+  - **Confirmed correct**: the next live test did show the "session has
+    likely expired" error on both getters (not silence), proving the
+    login-page detection itself works as designed. The *why* behind the
+    rejection turned out to be a real cookie-handling bug, not a page-
+    specific quirk — see "Fixed: Cloudflare's bot-management cookies were
+    dropped" below.
 - **My Works timed out** ("could not reach AO3 (timeout)") for an account
   with zero published works — which per AO3's own `WorksController#index`
   source has no special-case redirect or slow path for zero results, it just
@@ -371,38 +367,63 @@ published works). Results:
   (not just once) specifically on My Works and nothing else, that pattern
   itself would be a useful clue to bring back here.
 
-Next session: with the emulator running (symlink `ao3.koplugin` into
-`koreader/plugins/`, per docs/SETUP.md) — this session's whole top-level-tab
-mechanism (`menu_setup.lua`) has never run against a real KOReader, so
-treat all of it as unverified, not just the usual "check the HTML parsing"
-caveat:
-- Confirm a new tab actually appears (both in the file manager and after
-  opening a book), showing the icon, not a "missing icon" placeholder.
-- Confirm tapping it shows "Public", "Marked for Later", "My Works", and
-  "Search AO3" as flat items — if it instead falls back into the Tools
-  menu as before, `menu_setup.lua`'s write likely failed silently (it never
-  raises, only `logger.warn`s — check `crash.log` for "ao3reader:" lines).
-- Log in with real credentials and confirm the account item switches to
-  the username with "Log out" in its submenu; try "Marked for Later" and
-  "My Works" — this is also the first real, end-to-end check of both
-  getters' HTML parsing against the live site (still unverified per the
-  note above). If titles/authors look right, move on to `search()`; if
-  not, the parsing assumptions in `ao3client.lua` are the first thing to
-  revisit.
-- Peek at `settings/reader_menu_order.lua` and `settings/
-  filemanager_menu_order.lua` afterwards to sanity-check what actually got
-  written.
-- Check Tools -> Plugin management (or wherever this KOReader build lists
-  plugins) shows "AO3 fic search" with its description — confirms
-  `_meta.lua` is well-formed and actually found.
-- Re-test "Marked for Later" and "My Works" now that the login-page
-  detection and User-Agent header are in — see "First live test" above for
-  what to look for in whatever error (if any) comes back this time.
-- Try logging in with a deliberately wrong password: should now show an
-  error and leave the account menu reading "Public", not the username —
-  see "Fixed: wrong credentials were read as a successful login" above.
-- Confirm the account submenu now shows "My Works" above "Log out" when
-  logged in, and that the top-level tab only has three flat items (account,
-  Marked for Later, Search AO3) — if a device already had the tab installed
-  from an earlier session, this also confirms `patchOrderFile()`'s
-  item-list sync actually took effect, not just a fresh install.
+**Confirmed in the follow-up session** (real emulator, real account, WSL2 +
+WSLg): the top-level tab appears with its icon and the correct flat items
+(also double-checked directly in `settings/filemanager_menu_order.lua`),
+login with real credentials switches the account item to the username, and
+— after the Cloudflare cookie fix below — both "Marked for Later" and "My
+Works" return real, correctly parsed results. That closes out this
+session's whole checklist except the items listed under "Next session"
+below.
+
+## Fixed: Cloudflare's bot-management cookies were dropped, breaking every request after login
+
+Root cause of the "First live test" bug above, found by curling AO3's real
+login page directly (not guessed): `archiveofourown.org` runs behind
+**Cloudflare** (`server: cloudflare`), which sets two of its own cookies —
+`__cf_bm` (Bot Management) and `_cfuvid` — on every response, alongside the
+app's own `_otwarchive_session`. A real browser, and every working
+unofficial AO3 client checked for comparison (e.g. `wendytg/ao3_api`, which
+just uses Python's `requests.Session()` for its whole GET→POST→GET flow),
+automatically keeps and resends *all* of a site's cookies. This plugin only
+ever tracked `_otwarchive_session` and silently dropped the Cloudflare ones
+— it didn't even resend the login page GET's cookies on the login POST
+itself. Without them, Cloudflare has no way to recognize a follow-up
+request as coming from the same client that just authenticated, so every
+account-page request (`/users/<name>/readings?show=to-read`,
+`/users/<name>/works` — exactly the two pages `getMarkedForLater()`/
+`getMyWorks()` hit) got bounced back to the login page, even though
+`login()` itself succeeded.
+
+Fix, in `ao3client.lua`: a small generalized cookie jar. `merge_cookies()`
+pulls `__cf_bm`/`_cfuvid` (listed in `EXTRA_COOKIE_NAMES`) out of *any*
+response's `Set-Cookie` header the same way `_otwarchive_session` was
+already extracted, and `AO3Client:buildCookieHeader()` combines whatever's
+known (session cookie + Cloudflare cookies) into one `Cookie` header sent
+on every request — including, now, the login POST itself, using cookies
+picked up from the login page's own GET. Cookies are re-merged after every
+response (login's GET and POST, and every `fetchWorkListing()` call), since
+`__cf_bm` rotates periodically. `session_cookie`'s own meaning is
+unchanged, so this didn't require touching any test that asserted on it
+directly. Two regression tests added in `spec/ao3client_spec.lua`: one
+confirming the login POST resends cookies captured from the GET, one
+confirming `getMarkedForLater()` sends the full cookie set and picks up a
+rotated `__cf_bm` on the next call.
+
+Confirmed fixed live: after this change, both "Marked for Later" and "My
+Works" returned real results in the emulator against a real logged-in
+account (see "Confirmed in the follow-up session" above) — no more
+redirect-to-login on either getter.
+
+Next session:
+- Live-retest a deliberately wrong password (error shown, account menu
+  stays "Public") — not re-confirmed in the Cloudflare-fix session, only
+  covered by the unit tests and an earlier session's own live check.
+- Check Tools -> Plugin management shows "AO3 fic search" with its
+  description — not yet checked on a real KOReader build.
+- Peek at `settings/reader_menu_order.lua` (the reader-mode, as opposed to
+  file-manager, tab order file) to confirm it matches
+  `filemanager_menu_order.lua`'s already-confirmed shape.
+- Move on to `search()` and `getDownloadUrl()` (still unimplemented — see
+  the TODOs in `ao3client.lua`), now that login and both listing getters
+  are confirmed working end-to-end against the real site.

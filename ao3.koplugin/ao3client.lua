@@ -36,6 +36,18 @@ local LOGIN_FIELD_USERNAME = "user[login]"
 local LOGIN_FIELD_PASSWORD = "user[password]"
 local SESSION_COOKIE_NAME = "_otwarchive_session"
 
+-- AO3 sits behind Cloudflare, which sets its own bot-management cookies
+-- alongside the app's session cookie -- confirmed by inspecting real
+-- response headers from archiveofourown.org (`server: cloudflare`,
+-- `set-cookie: __cf_bm=...`, `set-cookie: _cfuvid=...`). A real browser (and
+-- every requests.Session()-based unofficial AO3 client) automatically keeps
+-- and resends these on every request; a client that only tracks
+-- _otwarchive_session, as this plugin used to, gets treated as a different
+-- client on each request. That's the confirmed cause of a real bug: login()
+-- itself succeeded, but getMarkedForLater()/getMyWorks() came back
+-- redirected to the login page every time -- see CLAUDE.md.
+local EXTRA_COOKIE_NAMES = { "__cf_bm", "_cfuvid" }
+
 -- Standard percent-encoding for a form field value.
 local function url_encode(str)
     str = tostring(str)
@@ -65,6 +77,32 @@ local function html_unescape(str)
     return (str:gsub("&#?%w+;", function(entity)
         return HTML_ENTITIES[entity] or entity
     end))
+end
+
+--[[--
+Pulls any of `names` out of a response's Set-Cookie header and merges them
+into `into` (a plain name -> value table, kept across calls so a later
+response's rotated __cf_bm, e.g., overwrites an earlier one instead of being
+lost). Reuses the same "match up to the next ; or ," trick login() already
+relies on for SESSION_COOKIE_NAME, since LuaSocket folds multiple Set-Cookie
+headers into one comma-joined string and cookie expiry dates contain commas
+too -- see the module comment on default_http_request().
+
+@param headers table?  lowercase-keyed response headers
+@param names string[]  cookie names to look for
+@param into table  name -> value, mutated in place
+]]
+local function merge_cookies(headers, names, into)
+    local set_cookie = headers and (headers["set-cookie"] or headers["Set-Cookie"])
+    if not set_cookie then
+        return
+    end
+    for _, name in ipairs(names) do
+        local value = set_cookie:match(name .. "=([^;,]+)")
+        if value then
+            into[name] = value
+        end
+    end
 end
 
 --[[--
@@ -160,7 +198,27 @@ function AO3Client.new(http_request)
     local self = setmetatable({}, AO3Client)
     self.http_request = http_request or default_http_request
     self.session_cookie = nil -- set by login(), required for getMarkedForLater()
+    self.extra_cookies = {} -- Cloudflare's cookies (EXTRA_COOKIE_NAMES) -- see merge_cookies()
     return self
+end
+
+--- Builds the value for a request's Cookie header from everything known so
+--- far: the AO3 session cookie (once login() has set it) plus any Cloudflare
+--- cookies picked up from previous responses. Returns nil (no header at all)
+--- rather than an empty string when nothing is known yet.
+-- @return string?
+function AO3Client:buildCookieHeader()
+    local parts = {}
+    if self.session_cookie then
+        table.insert(parts, self.session_cookie)
+    end
+    for _, name in ipairs(EXTRA_COOKIE_NAMES) do
+        local value = self.extra_cookies[name]
+        if value then
+            table.insert(parts, name .. "=" .. value)
+        end
+    end
+    return #parts > 0 and table.concat(parts, "; ") or nil
 end
 
 --[[--
@@ -181,13 +239,17 @@ function AO3Client:login(username, password)
         return false, "password is required"
     end
 
-    local page_ok, page_status, _, page_body = self.http_request({
+    local page_ok, page_status, page_headers, page_body = self.http_request({
         url = LOGIN_URL,
         method = "GET",
     })
     if not page_ok then
         return false, "could not reach AO3 (" .. tostring(page_status) .. ")"
     end
+    -- Cloudflare hands out __cf_bm/_cfuvid on this very first request, before
+    -- any credentials are even involved -- capture them now so the POST below
+    -- can send them straight back, the way a real browser would.
+    merge_cookies(page_headers, EXTRA_COOKIE_NAMES, self.extra_cookies)
 
     -- AO3 (a Rails app) exposes the CSRF token as a <meta> tag on every page.
     local csrf_token = page_body and page_body:match('name="csrf%-token" content="([^"]+)"')
@@ -207,12 +269,16 @@ function AO3Client:login(username, password)
         headers = {
             ["Content-Type"] = "application/x-www-form-urlencoded",
             ["Content-Length"] = tostring(#body),
+            Cookie = self:buildCookieHeader(),
         },
         body = body,
     })
     if not post_ok then
         return false, "login request failed (" .. tostring(post_status) .. ")"
     end
+    -- Cloudflare may rotate __cf_bm again on this response; keep whatever's
+    -- freshest regardless of whether the login itself succeeds below.
+    merge_cookies(post_headers, EXTRA_COOKIE_NAMES, self.extra_cookies)
 
     -- AO3 redirects (302/303) on BOTH a successful login and a rejected one
     -- -- confirmed against AO3's own source: it's plain Devise underneath,
@@ -325,14 +391,15 @@ function AO3Client:fetchWorkListing(url, fallback_author)
         return nil, "not logged in"
     end
 
-    local ok, status, _, body = self.http_request({
+    local ok, status, headers, body = self.http_request({
         url = url,
         method = "GET",
-        headers = { Cookie = self.session_cookie },
+        headers = { Cookie = self:buildCookieHeader() },
     })
     if not ok then
         return nil, "could not reach AO3 (" .. tostring(status) .. ")"
     end
+    merge_cookies(headers, EXTRA_COOKIE_NAMES, self.extra_cookies)
     if status ~= 200 then
         return nil, "unexpected response (" .. tostring(status) .. ") — the session may have expired, try login() again"
     end

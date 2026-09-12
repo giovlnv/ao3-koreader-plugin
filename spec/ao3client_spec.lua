@@ -168,6 +168,31 @@ describe("AO3Client#login", function()
         assert.matches("user%[password%]=p%%40ss%+word%%21", captured_post_opts.body)
     end)
 
+    it("resends Cloudflare's cookies from the GET on the login POST", function()
+        -- Regression check: archiveofourown.org sits behind Cloudflare, which
+        -- sets __cf_bm/_cfuvid on the very first request. A client that
+        -- drops these (as this plugin used to) gets treated as a different
+        -- client on every subsequent request -- the confirmed cause of
+        -- getMarkedForLater()/getMyWorks() coming back redirected to the
+        -- login page despite login() itself succeeding. See CLAUDE.md.
+        local captured_post_opts
+        local client = AO3Client.new(function(opts)
+            if opts.method == "POST" then
+                captured_post_opts = opts
+                return 1, 302, { ["location"] = "https://archiveofourown.org/users/someuser" }
+            end
+            return 1, 200, {
+                ["set-cookie"] = "__cf_bm=cfbm123; path=/; HttpOnly, "
+                    .. "_cfuvid=cfuvid456; path=/; HttpOnly",
+            }, '<meta name="csrf-token" content="tok123">'
+        end)
+
+        client:login("someuser", "somepass")
+
+        assert.is_not_nil(captured_post_opts)
+        assert.are.equal("__cf_bm=cfbm123; _cfuvid=cfuvid456", captured_post_opts.headers.Cookie)
+    end)
+
     it("fails cleanly when the initial GET itself fails", function()
         local client = AO3Client.new(fake_http({
             { ok = nil, status = "connection refused" },
@@ -258,6 +283,29 @@ describe("AO3Client#getMarkedForLater", function()
             captured_opts.url
         )
         assert.are.equal("_otwarchive_session=abc123", captured_opts.headers.Cookie)
+    end)
+
+    it("also sends Cloudflare's cookies picked up during login, and updates them on rotation", function()
+        local client = logged_in_client(nil)
+        client.extra_cookies = { ["__cf_bm"] = "cfbm-old" }
+
+        local captured_opts
+        local client_calls = 0
+        client.http_request = function(opts)
+            client_calls = client_calls + 1
+            captured_opts = opts
+            if client_calls == 1 then
+                -- Cloudflare rotates __cf_bm on this response.
+                return 1, 200, { ["set-cookie"] = "__cf_bm=cfbm-new; path=/; HttpOnly" }, SAMPLE_PAGE
+            end
+            return 1, 200, {}, SAMPLE_PAGE
+        end
+
+        client:getMarkedForLater()
+        assert.are.equal("_otwarchive_session=abc123; __cf_bm=cfbm-old", captured_opts.headers.Cookie)
+
+        client:getMarkedForLater()
+        assert.are.equal("_otwarchive_session=abc123; __cf_bm=cfbm-new", captured_opts.headers.Cookie)
     end)
 
     it("returns an empty list, not an error, when there's nothing marked", function()
