@@ -259,6 +259,26 @@ describe("AO3Client#getMarkedForLater", function()
         assert.is_nil(works)
         assert.is_not_nil(err)
     end)
+
+    it("treats a login-page response as an expired session, not an empty list", function()
+        -- A 200 with AO3's own login page in the body -- e.g. an
+        -- expired/rejected session cookie that got silently redirected back
+        -- to /users/login -- used to read as "zero works found", with no
+        -- error at all. This is the regression check for that.
+        local client = logged_in_client(fake_http({
+            {
+                ok = 1,
+                status = 200,
+                body = '<meta name="csrf-token" content="tok123">'
+                    .. '<input name="user[login]" type="text">',
+            },
+        }))
+
+        local works, err = client:getMarkedForLater()
+
+        assert.is_nil(works)
+        assert.is_not_nil(err)
+    end)
 end)
 
 describe("AO3Client#getMyWorks", function()
@@ -367,6 +387,22 @@ describe("AO3Client#getMyWorks", function()
     it("fails cleanly when the request itself fails", function()
         local client = logged_in_client(fake_http({
             { ok = nil, status = "connection refused" },
+        }))
+
+        local works, err = client:getMyWorks()
+
+        assert.is_nil(works)
+        assert.is_not_nil(err)
+    end)
+
+    it("treats a login-page response as an expired session, not an empty list", function()
+        local client = logged_in_client(fake_http({
+            {
+                ok = 1,
+                status = 200,
+                body = '<meta name="csrf-token" content="tok123">'
+                    .. '<input name="user[login]" type="text">',
+            },
         }))
 
         local works, err = client:getMyWorks()

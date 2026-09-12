@@ -18,6 +18,15 @@ AO3Client.__index = AO3Client
 local BASE_URL = "https://archiveofourown.org"
 local LOGIN_URL = BASE_URL .. "/users/login"
 
+-- Sent on every request, merged under whatever the caller passes (so e.g.
+-- login()'s Content-Type/Content-Length still win). AO3's own terms ask
+-- automated tools to identify themselves rather than impersonate a browser,
+-- and a missing/generic User-Agent is also a common trigger for anti-bot
+-- blocking -- this plugin only fetches things the logged-in user's own
+-- account can already see, so there's nothing to hide from AO3 here.
+local DEFAULT_USER_AGENT = "ao3-koreader-plugin (personal KOReader plugin; "
+    .. "fetches only the logged-in account's own pages)"
+
 -- AO3's login form, as of checking against a currently-maintained unofficial
 -- AO3 client library (see docs/SETUP.md notes) — Rails form/param names are
 -- an implementation detail AO3 could change without notice. If login starts
@@ -127,11 +136,16 @@ local function default_http_request(opts)
     -- resolver can still hang past this timeout. See CLAUDE.md.
     socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
 
+    local request_headers = { ["User-Agent"] = DEFAULT_USER_AGENT }
+    for key, value in pairs(opts.headers or {}) do
+        request_headers[key] = value
+    end
+
     local response_chunks = {}
     local ok, status, headers = https.request({
         url = opts.url,
         method = opts.method or "GET",
-        headers = opts.headers,
+        headers = request_headers,
         source = opts.body and ltn12.source.string(opts.body) or nil,
         sink = ltn12.sink.table(response_chunks),
     })
@@ -260,6 +274,28 @@ local function parse_work_listing(body, fallback_author)
 end
 
 --[[--
+True when `body` looks like AO3's login page rather than the listing page we
+asked for. Reuses the exact form field name (`user[login]`) login() itself
+submits credentials to, since that's already confirmed correct against the
+real site — not a new guess.
+
+A logged-in-only page can come back as this in more ways than a non-200
+status: AO3 may 302-redirect an expired/rejected session straight to
+/users/login, and some HTTP clients (including, as far as we've been able to
+tell, the one this plugin runs on) follow that redirect transparently and
+hand back a plain 200 with the login page's body — which, without this
+check, parse_work_listing() would just silently read as zero works, no error
+at all. That's indistinguishable on screen from a genuinely empty list,
+which is exactly the bug this guards against.
+
+@param body string?
+@return boolean
+]]
+local function looks_like_login_page(body)
+    return body ~= nil and body:find('name="user%[login%]"') ~= nil
+end
+
+--[[--
 Fetches a logged-in-only listing page and turns it into work entries. Shared
 GET/status-check/parse plumbing for getMarkedForLater() and getMyWorks().
 
@@ -283,6 +319,9 @@ function AO3Client:fetchWorkListing(url, fallback_author)
     end
     if status ~= 200 then
         return nil, "unexpected response (" .. tostring(status) .. ") — the session may have expired, try login() again"
+    end
+    if looks_like_login_page(body) then
+        return nil, "AO3 sent back the login page instead of your results — the session has likely expired, log in again"
     end
 
     return parse_work_listing(body, fallback_author)

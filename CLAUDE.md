@@ -247,6 +247,72 @@ fails too, that points there rather than at this plugin's code.
 
 Not yet implemented: `search()`, `getDownloadUrl()`.
 
+## First live test: Marked for Later came back empty, My Works timed out
+
+First real on-device test of `getMarkedForLater()`/`getMyWorks()` (a real
+account, logged in, with actual entries in "Marked for Later" and zero
+published works). Results:
+
+- **Marked for Later showed "Nothing in Marked for Later" despite the
+  account genuinely having entries** (confirmed by opening the same URL —
+  `/users/<name>/readings?show=to-read` — in a real browser). Checked the
+  real markup this generates by reading AO3's own source
+  (`otwcode/otwarchive` on GitHub, `app/views/readings/_reading_blurb.html.erb`
+  and `app/views/works/_work_blurb.html.erb`): both partials render
+  `id="work_<id>" class="...blurb..."` in the same shape, sharing the same
+  `works/work_module` partial for the title/author markup — so
+  `split_work_blurbs()`/`parse_work_listing()` should structurally handle
+  both pages identically, and there's no evidence of a page-specific parsing
+  bug. That points at a different, and quietly dangerous, bug: **before this
+  fix, any HTTP 200 response that didn't contain matching blurb markup was
+  read as "an empty list", with no way to tell that apart from a real
+  rejected/expired session.** If AO3 responded with something other than the
+  listing page — most plausibly its own login page, if the session cookie
+  was rejected for that specific request, or a redirect that got followed
+  transparently into one — that would explain exactly what was seen: silence
+  where an error should have been.
+  - Fix: `fetchWorkListing()` now calls a new `looks_like_login_page(body)`
+    check (reusing the exact `user[login]` form-field name `login()` already
+    submits credentials to) before treating a 200 response as real results.
+    If it matches, it now returns a clear error ("AO3 sent back the login
+    page instead of your results — the session has likely expired") instead
+    of silently reporting zero works. Two regression tests added (one per
+    getter) in `spec/ao3client_spec.lua`.
+  - Also added a `DEFAULT_USER_AGENT` header, now sent (and merged under any
+    caller-supplied headers) on every request in `default_http_request()`.
+    AO3's terms ask automated tools to identify themselves, and a
+    missing/generic User-Agent is also a common trigger for anti-bot
+    blocking on sites like this — a plausible independent contributor to
+    getting served something other than the real page. Genuinely honest,
+    not a browser-impersonation string.
+  - **Still not fully confirmed**: this is the best-supported explanation
+    given what the real source says the markup should be, but nobody has
+    actually seen the raw response AO3 sent back that day. If "Marked for
+    Later" still comes back empty after this fix, the new error message
+    itself is the next diagnostic signal — if it now says "session has
+    likely expired", the login-page theory was right and the real question
+    becomes *why* the session was being rejected for this endpoint
+    specifically (cookie scope? an additional cookie AO3 also expects?); if
+    it goes back to silently saying "Nothing in Marked for Later" with a
+    real entry existing, this fix didn't address the actual cause and the
+    next step is capturing the raw response body for a real look (e.g.
+    temporarily have `showWorkListing()` show `err` or a body snippet in the
+    `InfoMessage` instead of swallowing it).
+- **My Works timed out** ("could not reach AO3 (timeout)") for an account
+  with zero published works — which per AO3's own `WorksController#index`
+  source has no special-case redirect or slow path for zero results, it just
+  renders the same page with an empty `<ol>`. A real socket-level timeout
+  (`ok` came back falsy) happens before any of the parsing/session-detection
+  logic above even runs, so this looks unrelated to the Marked-for-Later
+  bug — most likely the same category of flakiness already documented below
+  ("Known issue: login/list requests could hang the whole UI"), i.e.
+  Wi-Fi/DNS/connection hiccups rather than a plugin bug. Not changed this
+  session beyond what the User-Agent addition might incidentally help with
+  (some anti-bot setups intentionally stall requests they're suspicious of,
+  which would also present as a timeout) — if it recurs consistently
+  (not just once) specifically on My Works and nothing else, that pattern
+  itself would be a useful clue to bring back here.
+
 Next session: with the emulator running (symlink `ao3.koplugin` into
 `koreader/plugins/`, per docs/SETUP.md) — this session's whole top-level-tab
 mechanism (`menu_setup.lua`) has never run against a real KOReader, so
@@ -271,3 +337,6 @@ caveat:
 - Check Tools -> Plugin management (or wherever this KOReader build lists
   plugins) shows "AO3 fic search" with its description — confirms
   `_meta.lua` is well-formed and actually found.
+- Re-test "Marked for Later" and "My Works" now that the login-page
+  detection and User-Agent header are in — see "First live test" above for
+  what to look for in whatever error (if any) comes back this time.
