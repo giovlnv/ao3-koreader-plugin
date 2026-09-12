@@ -1,0 +1,9 @@
+-- busted looks for this file automatically when you run `busted` from the
+-- repo root. lpath tells it where to find ao3client.lua so specs can just
+-- do `require("ao3client")` instead of fighting the dot in "ao3.koplugin".
+return {
+    default = {
+        lpath = "ao3.koplugin/?.lua",
+        verbose = true,
+    },
+}
