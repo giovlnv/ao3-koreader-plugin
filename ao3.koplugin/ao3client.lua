@@ -59,6 +59,15 @@ local function url_encode(str)
     return str
 end
 
+-- Reverses url_encode()'s percent-encoding -- used for turning a download
+-- URL's filename segment back into a normal filename, not for decoding form
+-- data (this plugin never receives any).
+local function url_decode(str)
+    return (str:gsub("%%(%x%x)", function(hex)
+        return string.char(tonumber(hex, 16))
+    end))
+end
+
 -- Only the handful of entities that actually show up in fic titles/author
 -- names (ampersands and quotes, mostly). Not a general HTML-entity decoder.
 local HTML_ENTITIES = {
@@ -268,6 +277,36 @@ local function strip_summary_html(html)
     text = text:gsub(" ?\n ?", "\n")
     text = text:gsub("\n\n+", "\n\n")
     return (text:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+--[[--
+Collects the series a work belongs to, e.g. `Part 1 of "World of Vita
+Mortis"` -- confirmed against real blurbs that a work can list more than
+one (AO3 lets a work belong to several series at once), each as its own
+`<li>` inside `<ul class="series">`, the same one-`<li>`-per-entry shape
+already confirmed for the Tags section (see extract_tag_group()). Not every
+blurb has this section at all -- most works aren't part of a series.
+
+@param html string  one work's blurb (or work-page) HTML
+@return table[]  { { part = number, name = string, url = string }, ... }
+]]
+local function extract_series(html)
+    local list_html = html:match('<ul class="series">(.-)</ul>')
+    if not list_html then
+        return {}
+    end
+    local series = {}
+    for li in list_html:gmatch("<li>(.-)</li>") do
+        local part, url_path, name = li:match('Part%s*<strong>(%d+)</strong>%s*of%s*<a href="([^"]+)">([^<]+)</a>')
+        if part then
+            table.insert(series, {
+                part = tonumber(part),
+                name = html_unescape(name),
+                url = BASE_URL .. url_path,
+            })
+        end
+    end
+    return series
 end
 
 --[[--
@@ -530,8 +569,8 @@ no author link is just AO3 omitting "by yourself" — it's still you).
 @param body string  the page's HTML
 @param fallback_author string  used when a blurb has no `rel="author"` link
 @return table[] works  list of { id, title, author, url, rating, category,
-  status, warnings, tags, words, chapters, summary } -- every field past
-  `url` is nil/empty if the expected markup wasn't found in that blurb,
+  status, warnings, tags, words, chapters, summary, series } -- every field
+  past `url` is nil/empty if the expected markup wasn't found in that blurb,
   rather than failing the whole entry (see below)
 ]]
 local function parse_work_listing(body, fallback_author)
@@ -569,6 +608,7 @@ local function parse_work_listing(body, fallback_author)
                 words = words and tonumber((words:gsub(",", ""))),
                 chapters = extract_stat(blurb.html, "chapters"),
                 summary = summary_html and strip_summary_html(summary_html),
+                series = extract_series(blurb.html),
             })
         end
         -- A blurb whose title we couldn't find is silently skipped rather
@@ -695,17 +735,116 @@ function AO3Client:search(query)
     return parse_work_listing(body, "Anonymous")
 end
 
---- Returns the direct download URL AO3 generates for a work.
--- @param work_id string|number
--- @param format string one of "EPUB", "MOBI", "PDF", "HTML"
--- @return string? url
--- @return string? err
+--[[--
+Returns the direct download URL AO3 generates for a work, by fetching the
+work's own page and reading the real link out of its "Download" dropdown --
+not by reconstructing AO3's filename-slug rule ourselves. That rule turned
+out to be non-trivial (confirmed against several real work pages: a comma
+in the title gets stripped entirely, e.g. "Test, test" -> "Test_test.epub",
+while a hyphen is kept as-is, e.g. "Test-test" -> "Test-test.epub", and
+plain spaces become underscores) -- exactly the kind of rule this plugin
+would risk getting subtly wrong for some title it hasn't been tested
+against. AO3 already generated the real link; per CLAUDE.md, this plugin's
+whole job is finding and fetching what AO3 already made, not rebuilding any
+part of it.
+
+Public, like search() -- works whether or not login() has succeeded, for
+any work the requester can otherwise see (a login-restricted or
+adult-content-gated work without a working session simply won't have a
+matching download link on the page it gets back, surfacing as the same
+"no ... link found" error as a wrong format or work id).
+
+@param work_id string|number
+@param format string  one of "AZW3", "EPUB", "MOBI", "PDF", "HTML" --
+  case-insensitive, matched against the link text AO3 itself shows (always
+  uppercase on the real page, confirmed)
+@return string? url
+@return string? err
+]]
 function AO3Client:getDownloadUrl(work_id, format)
-    -- TODO: work pages expose a "Download" dropdown with links shaped like
-    -- BASE_URL .. "/downloads/<work_id>/<title-slug>.<format>"
-    -- (the title-slug segment is derived from the work title; test against
-    -- a real work page to get the exact rule right)
-    error("not implemented yet")
+    if not work_id or work_id == "" then
+        return nil, "work id is required"
+    end
+    if not format or format == "" then
+        return nil, "format is required"
+    end
+
+    local ok, status, headers, body = self.http_request({
+        url = BASE_URL .. "/works/" .. tostring(work_id),
+        method = "GET",
+        headers = { Cookie = self:buildCookieHeader() },
+    })
+    if not ok then
+        return nil, "could not reach AO3 (" .. tostring(status) .. ")"
+    end
+    merge_cookies(headers, EXTRA_COOKIE_NAMES, self.extra_cookies)
+    if status ~= 200 then
+        return nil, "unexpected response (" .. tostring(status) .. ") fetching the work page"
+    end
+
+    -- Anchored on the format's own label text (e.g. ">EPUB</a>"), not the
+    -- file extension in the href -- that's what's actually shown/clicked,
+    -- confirmed identical (always uppercase) across every format on a real
+    -- page, and sidesteps ever needing to know what extension a format uses.
+    local wanted_format = format:upper():gsub("%%", "%%%%")
+    local href = body:match('href="(/downloads/[^"]+)">' .. wanted_format .. "</a>")
+    if not href then
+        return nil, "no " .. format:upper() .. " download link found for this work"
+    end
+
+    return BASE_URL .. href
+end
+
+--[[--
+Downloads the raw bytes at a URL getDownloadUrl() returned. Uses the same
+cookie jar as every other request (session + Cloudflare), since a
+login-restricted work's download link only works with a working session.
+
+Returns the whole file as a Lua string, the same way every other request in
+this file works -- fine for the size fic downloads actually are, but worth
+knowing this holds the entire file in memory at once rather than streaming
+it to disk; a very large multi-part work collection could be the point
+where that stops being true. Saving those bytes to an actual file is
+KOReader-specific (paths, directories) and deliberately left to the caller,
+per this file's whole framework-agnostic design -- see main.lua.
+
+@param url string  from getDownloadUrl()
+@return string? bytes
+@return string? err
+]]
+function AO3Client:downloadFile(url)
+    if not url or url == "" then
+        return nil, "download url is required"
+    end
+
+    local ok, status, headers, body = self.http_request({
+        url = url,
+        method = "GET",
+        headers = { Cookie = self:buildCookieHeader() },
+    })
+    if not ok then
+        return nil, "could not reach AO3 (" .. tostring(status) .. ")"
+    end
+    merge_cookies(headers, EXTRA_COOKIE_NAMES, self.extra_cookies)
+    if status ~= 200 then
+        return nil, "unexpected response (" .. tostring(status) .. ") downloading the file"
+    end
+
+    return body
+end
+
+--- Derives a safe-ish local filename from a getDownloadUrl() URL: the last
+--- path segment, percent-decoded, with AO3's own `?updated_at=...`
+--- cache-busting query string dropped. Still needs to go through KOReader's
+--- own util.getSafeFilename() before actually being used as a path
+--- component -- this only undoes AO3's own URL escaping, it doesn't
+--- guarantee a filesystem-safe result on every platform.
+-- @param url string
+-- @return string
+function AO3Client.filenameFromDownloadUrl(url)
+    local path = url:match("^https?://[^/]+([^?]*)") or url
+    local filename = path:match("([^/]+)$") or path
+    return url_decode(filename)
 end
 
 return AO3Client

@@ -61,6 +61,17 @@ finds works, and fetches the file AO3 already made.
   flow`), body only if the "why" isn't obvious from the diff.
 - Prefer one feature per session/branch (e.g. "login", "search",
   "download") — keeps sessions easy to review and easy to pick back up.
+- **Never use `_` as a throwaway loop/param name in `main.lua` (or any file
+  that `local _ = require("gettext")`).** It silently shadows gettext's `_`
+  for the rest of that block, and calling `_("...")` inside then crashes the
+  whole emulator (`attempt to call upvalue '_' (a number value)`, or
+  whatever the shadowing value happens to be) -- not a soft error, a hard
+  crash. Confirmed the hard way: `for _, work in ipairs(works) do ...
+  _("Download") ... end` did exactly this. Neither `luacheck` nor `busted`
+  catches it -- `luacheck` deliberately treats `_` as "intentionally
+  unused" and never warns about it shadowing anything, and `busted` doesn't
+  test `main.lua` at all (see above) -- so this only ever surfaces as a
+  live crash. Use `_idx`, or name the loop variable, instead.
 
 ## Roadmap (v1 scope, as agreed)
 
@@ -68,7 +79,8 @@ finds works, and fetches the file AO3 already made.
 2. "Marked for Later" list → browsable menu — done, see Status
 3. Search AO3 by title/tag — done, see "Added: search()..." below
 4. Fetch a work's direct EPUB download link and save it where KOReader's
-   library expects new books — not started; the last major roadmap item
+   library expects new books — done, see "Added: download and save" below
+   -- the last v1 roadmap item
 5. (stretch) quick-look at a work's summary/metadata before downloading —
    done, see "Added: rich work metadata..." below
 
@@ -480,6 +492,168 @@ independently observed on a real multi-warning work.
 `formatWorkDetails()` assembles rating/category/status/warnings/word+chapter
 counts/tags/summary/url into one readable block, omitting whichever fields
 a given work doesn't have.
+
+## Added: getDownloadUrl()
+
+`AO3Client:getDownloadUrl(work_id, format)` is implemented and unit-tested.
+Deliberately does **not** reconstruct AO3's download-filename slug itself
+(the TODO it replaced assumed a simple title-to-slug rule) — fetched
+several real work pages instead, and the real rule turned out to be
+non-trivial: a comma in the title is stripped entirely (`"Test, test"` →
+`Test_test.epub`) while a hyphen is kept as-is (`"Test-test"` stays
+`Test-test.epub`), and plain spaces become underscores. Rather than risk
+getting that wrong for some title never tested against, `getDownloadUrl()`
+instead fetches `/works/<id>` and reads the real `<a href="/downloads/...">`
+link straight out of the page's own "Download" dropdown, matched by the
+format's own uppercase label text (`>EPUB</a>`, confirmed identical in
+shape across every format on a real page) rather than by file extension.
+This fits the project's own stated architecture (CLAUDE.md's very first
+section): AO3 already generated the real link; this plugin's job is
+finding and fetching what AO3 made, never rebuilding any part of it.
+
+Public like `search()` — works whether or not `login()` has succeeded, for
+any work the requester can otherwise see. A login-restricted or
+adult-content-gated work fetched without a working session just won't have
+a matching download link on the page that comes back, which surfaces as
+the same "no ... link found" error as a wrong format or work id — not
+specifically diagnosed as an access issue, a reasonable v1 gap.
+
+Real pages also showed a fifth format, AZW3 (Kindle's own format), not
+mentioned in the original TODO's four — `getDownloadUrl()` handles it the
+same way as the other four (nothing format-specific in the implementation),
+though only EPUB/MOBI/PDF/HTML are mentioned in the roadmap.
+
+## Added: download and save (roadmap item 4, complete)
+
+The rest of roadmap item 4 — actually downloading a work's bytes and
+saving them where KOReader's library expects new books — is implemented,
+including the format choice and folder-organization options asked for.
+
+`ao3client.lua` additions:
+- `AO3Client:downloadFile(url)` — fetches the raw bytes at a
+  `getDownloadUrl()` URL, through the same cookie jar as everything else.
+  Returns the whole file as a Lua string (like every other request in this
+  file), not streamed to disk — fine for fic-sized files, but worth
+  knowing if a future need ever involves much larger downloads.
+- `AO3Client.filenameFromDownloadUrl(url)` — a static helper (no `self`)
+  that derives a filename from the URL's last path segment, percent-decoded
+  and with AO3's `?updated_at=...` query string dropped.
+- `extract_series()` — new, and now part of every work `parse_work_listing()`
+  returns (`work.series`, a list of `{part, name, url}`, empty when a work
+  isn't part of one). Confirmed against real markup: a work can belong to
+  more than one series, each its own `<li>` inside `<ul class="series">`
+  (`<h6 class="landmark heading">Series</h6>` right before it) — the same
+  one-`<li>`-per-entry shape already confirmed for Tags/warnings. The
+  multi-series case specifically is inferred from that pattern, not
+  independently observed on a real work in more than one series.
+
+`main.lua` additions:
+- The work-detail `TextViewer` (see "Added: rich work metadata" above) now
+  has a **Download** button (via its `buttons_table`), alongside the
+  default Close button (`add_default_buttons = true`). Tapping it opens
+  `showDownloadDialog()`: one button per format AO3 actually offers
+  (`DOWNLOAD_FORMATS = {"EPUB", "MOBI", "PDF", "HTML", "AZW3"}`), with the
+  resolved save folder shown in the dialog's title before committing to a
+  download — this is where the format-choice ask is answered.
+- `downloadWork()` chains `getDownloadUrl()` → `downloadFile()` → `saveDownloadedFile()`,
+  each blocking call getting its own loading message (`NetworkMgr:runWhenOnline`-wrapped,
+  same pattern as every other network action in this file).
+- `saveDownloadedFile()` creates the destination directory if needed
+  (`util.makePath()` — a real KOReader utility, "mkdir -p" semantics),
+  sanitizes the filename (`util.getSafeFilename()` — also real KOReader,
+  handles VFAT's character/length limits), asks before overwriting an
+  existing file (`ConfirmBox`, matching the exact convention KOReader's own
+  OPDS plugin uses for the same situation), writes the bytes, and refreshes
+  the file browser (`self.ui.file_chooser:refreshPath()`) if this plugin's
+  menu was opened from there rather than from inside a book's reader menu.
+- **Download settings**, a new item in the AO3 Reader tab (`ao3_download_settings`
+  in `menu_setup.lua`'s `TAB_ITEM_IDS` — its self-syncing item-list mechanism,
+  built for exactly this kind of addition, picked this up with no other
+  changes needed there): "Download folder: <path>", which opens
+  `ui/downloadmgr` — KOReader's own native folder-picker widget, the same
+  one OPDS uses for its own download folder, not a custom-built chooser —
+  and a checkbox-style toggle, "Organize into series folders"
+  (`checked_func`/`callback`, the standard KOReader toggle-menu-item shape).
+  This is where the configurable-folder ask is answered. Both settings
+  persist via `G_reader_settings` (`ao3_download_dir`, `ao3_use_series_folders`)
+  — the same persistence mechanism already flagged as a reasonable follow-up
+  for `session_cookie`/username, still not done for those (see Status).
+  `getDownloadDir()` defaults to `filemanagerutil.getHomeFolder()` (KOReader's
+  own configured library folder) when nothing's been chosen yet.
+  `getUseSeriesFolders()` defaults to **off** — an opt-in, since it changes
+  where files land and shouldn't surprise anyone who hasn't asked for it.
+  `downloadDirFor(work)` combines both: the configured folder, plus a
+  subfolder named after the work's first series (sanitized through
+  `util.getSafeFilename()` too) when that setting is on and the work has one.
+
+**Not yet live-tested against the real site** — written against KOReader's
+own real, confirmed APIs (`ui/downloadmgr`, `util.getSafeFilename`,
+`util.makePath`, `ConfirmBox`, `TextViewer.buttons_table`, all checked
+directly against KOReader's own source in `~/koreader/frontend`, not
+guessed), and `ao3client.lua`'s pieces are unit-tested, but nobody has yet
+tapped Download in the actual emulator. Next session's first item: pick a
+real work, try every format, try the folder picker, try the series-folder
+toggle with a work that's actually in a series (browsing works by a
+partial-completion filter surfaced several live examples while researching
+this — e.g. AO3 series id 6332816, "World of Vita Mortis" — if a fresh one
+is needed to test against).
+
+## Added: layout revision (work-detail screen + tab menu)
+
+Two deliberate layout changes, requested once the v1 roadmap (all 5 items)
+was otherwise done and the plugin had grown organically over several
+sessions' worth of additions.
+
+**Work-detail screen**: `formatWorkDetails()` now builds real HTML instead
+of plain stacked text lines — section headers (`<h4>`) for Tags/Summary,
+bold labels, italics for the author/series line. This uses
+`TextViewer`'s HTML rendering mode (`text_format = "html"`,
+`text_type = "book_info"` — matching the exact `text_type` KOReader's own
+OPDS plugin uses for the same kind of thing, a rich book description),
+backed by the real HTML+CSS engine KOReader renders actual books with
+(confirmed in `~/koreader/frontend/ui/widget/scrollhtmlwidget.lua`, not
+assumed) — not a custom renderer, and not something that needed a new
+library. TextViewer's own internal CSS is fixed, not overridable from the
+caller, so this deliberately sticks to plain semantic tags rather than
+trying to control exact fonts/spacing.
+
+This is also a correctness fix, not purely cosmetic: every value going
+into that HTML (title, tags, summary, author, ...) is free-form text AO3's
+own users wrote, not something this plugin generated, and can and does
+contain `&`/`<`/`>` for real. A new `escapeHtml()` — the mirror image of
+`ao3client.lua`'s `html_unescape()`, which decodes AO3's markup on the way
+in — escapes all of it on the way back out to HTML, or a literal `&` in a
+title (a real, common case: crossover fandom tags are written exactly like
+`"Fandom A & Fandom B"`) would either break the markup or silently vanish.
+
+**Tab menu**: `menu_setup.lua`'s `TAB_ITEM_IDS` now has a
+`"----------------------------"` divider between the three things you *do*
+(Account, Marked for Later, Search AO3) and the one thing that's
+configuration (Download settings). That dashed-string entry is a real,
+pre-existing KOReader convention for a divider inside an item list —
+confirmed throughout KOReader's own menu definitions
+(`~/koreader/frontend/ui/elements/filemanager_menu_order.lua`'s own
+`setting`/`device`/`navigation` entries all use it the same way), not
+invented for this. `menu_setup.lua`'s existing self-syncing mechanism
+(built during an earlier session specifically so this tab's item list could
+change without every already-installed device needing a fresh install —
+see "AO3 Reader's own menu tab" above) picks this up with no other code
+changes needed.
+
+Deliberately **not** changed: "Marked for Later" stays a flat top-level
+item rather than moving into the account submenu alongside "My Works",
+even though both require login. That's an intentional asymmetry from an
+earlier session (see "AO3 Reader's own menu tab" above), not an
+inconsistency — Marked for Later is almost certainly this plugin's most
+common action (the whole reason to open it day-to-day), so it stays one tap
+away; "My Works" is a rarer, self-referential one, which is why it moved
+into the account submenu in the first place.
+
+**Not yet live-tested** — same caveat as "Added: download and save" above
+(the emulator has only been confirmed not to crash opening a work's detail
+screen since the `_` shadowing fix, not that the new HTML actually renders
+correctly, or that the new menu divider actually shows up as a visual
+line rather than, say, an empty/broken row).
 
 ## Fixed: login() trusted its own success heuristic without verifying the session actually worked
 

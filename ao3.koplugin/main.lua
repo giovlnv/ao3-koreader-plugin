@@ -8,6 +8,8 @@ running KOReader instance — nothing in this file is covered by the busted
 suite, since it all depends on real KOReader widgets.
 ]]
 
+local ButtonDialog = require("ui/widget/buttondialog")
+local ConfirmBox = require("ui/widget/confirmbox")
 local InfoMessage = require("ui/widget/infomessage")
 local InputDialog = require("ui/widget/inputdialog")
 local Menu = require("ui/widget/menu")
@@ -17,11 +19,40 @@ local NetworkMgr = require("ui/network/manager")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local ffiUtil = require("ffi/util")
+local lfs = require("libs/libkoreader-lfs")
+local util = require("util")
 local T = ffiUtil.template
 local _ = require("gettext")
 
 local AO3Client = require("ao3client")
 local MenuSetup = require("menu_setup")
+
+-- Every format AO3's own "Download" dropdown offers on a real work page,
+-- confirmed directly (see CLAUDE.md) -- AZW3 (Kindle's own format) included,
+-- even though only the other four were in the original v1 roadmap wording.
+local DOWNLOAD_FORMATS = { "EPUB", "MOBI", "PDF", "HTML", "AZW3" }
+
+--- Where downloaded works get saved -- user-configurable (see
+--- "Download settings" in addToMainMenu()), falling back to KOReader's own
+--- configured library folder if nothing's been chosen yet.
+-- @return string
+local function getDownloadDir()
+    return G_reader_settings:readSetting("ao3_download_dir")
+        or require("apps/filemanager/filemanagerutil").getHomeFolder()
+end
+
+--- Whether to file a downloaded work under a subfolder named after its
+--- series, when it has one -- off by default (opt-in, see "Download
+--- settings"), since it changes where files land and shouldn't surprise
+--- anyone who hasn't asked for it.
+-- @return boolean
+local function getUseSeriesFolders()
+    local value = G_reader_settings:readSetting("ao3_use_series_folders")
+    if value == nil then
+        return false
+    end
+    return value
+end
 
 local AO3Reader = WidgetContainer:extend({
     name = "ao3reader",
@@ -121,30 +152,67 @@ function AO3Reader:logout()
     }))
 end
 
+-- Every field in a work table (title, author, tags, summary, ...) is
+-- free-form text AO3's own users wrote, not something this plugin
+-- generated -- and can and does contain "&"/"<"/">" for real (e.g. a
+-- fandom crossover tagged "Fandom A & Fandom B"). formatWorkDetails()
+-- below builds real HTML now (see its own comment for why), so every one
+-- of those values needs this before being embedded, or a literal "&" in a
+-- title would either break the markup or silently vanish.
+local function escapeHtml(str)
+    return (tostring(str):gsub("[&<>\"']", {
+        ["&"] = "&amp;",
+        ["<"] = "&lt;",
+        [">"] = "&gt;",
+        ['"'] = "&quot;",
+        ["'"] = "&#39;",
+    }))
+end
+
 --[[--
 Formats one work's AO3-style details (rating/warnings/tags/summary/stats,
-same fields AO3's own listing pages show) as plain text for TextViewer.
-Every field but title/author/url is optional -- see parse_work_listing() in
-ao3client.lua -- and simply omitted here when a blurb didn't have it.
+same fields AO3's own listing pages show) as HTML, for TextViewer's HTML
+rendering mode (see the `text_format = "html"` passed alongside this in
+showWorkListing() below) -- real section headers and bold labels, a
+deliberate revision from this plugin's first pass at this screen, which
+just stacked everything as plain text lines with no visual hierarchy at
+all. TextViewer's HTML mode is backed by the same real HTML+CSS engine
+KOReader uses to render actual books (confirmed in
+~/koreader/frontend/ui/widget/scrollhtmlwidget.lua -- not a guess), so
+headings/bold/italic all render properly; TextViewer's own internal CSS
+is fixed and not overridable from here, so this deliberately sticks to
+plain semantic tags (h4/p/b/i) rather than trying to control exact styling.
+
+Every field but title/author/url is optional -- see parse_work_listing()
+in ao3client.lua -- and simply omitted here when a blurb didn't have it.
 
 @param work table  one entry from AO3Client's work listing/search results
-@return string
+@return string  HTML
 ]]
 local function formatWorkDetails(work)
-    local lines = { T(_("by %1"), work.author) }
+    local parts = { "<p><i>" .. T(_("by %1"), escapeHtml(work.author)) .. "</i></p>" }
 
     local badges = {}
-    for _, value in ipairs({ work.rating, work.category, work.status }) do
+    for _idx, value in ipairs({ work.rating, work.category, work.status }) do
         if value then
-            table.insert(badges, value)
+            table.insert(badges, escapeHtml(value))
         end
     end
     if #badges > 0 then
-        table.insert(lines, table.concat(badges, " · "))
+        table.insert(parts, "<p>" .. table.concat(badges, " &middot; ") .. "</p>")
     end
 
     if work.warnings and #work.warnings > 0 then
-        table.insert(lines, T(_("Warnings: %1"), table.concat(work.warnings, ", ")))
+        table.insert(parts, "<p><b>" .. _("Warnings:") .. "</b> "
+            .. escapeHtml(table.concat(work.warnings, ", ")) .. "</p>")
+    end
+
+    if work.series and #work.series > 0 then
+        local series_lines = {}
+        for _idx, series in ipairs(work.series) do
+            table.insert(series_lines, T(_("Part %1 of %2"), series.part, escapeHtml(series.name)))
+        end
+        table.insert(parts, "<p><i>" .. table.concat(series_lines, "; ") .. "</i></p>")
     end
 
     local stats = {}
@@ -152,36 +220,188 @@ local function formatWorkDetails(work)
         table.insert(stats, T(_("%1 words"), work.words))
     end
     if work.chapters then
-        table.insert(stats, T(_("Chapters: %1"), work.chapters))
+        table.insert(stats, T(_("Chapters: %1"), escapeHtml(work.chapters)))
     end
     if #stats > 0 then
-        table.insert(lines, table.concat(stats, " · "))
+        table.insert(parts, "<p>" .. table.concat(stats, " &middot; ") .. "</p>")
     end
 
     if work.tags and #work.tags > 0 then
-        table.insert(lines, "")
-        table.insert(lines, T(_("Tags: %1"), table.concat(work.tags, ", ")))
+        table.insert(parts, "<h4>" .. _("Tags") .. "</h4><p>"
+            .. escapeHtml(table.concat(work.tags, ", ")) .. "</p>")
     end
 
     if work.summary and work.summary ~= "" then
-        table.insert(lines, "")
-        table.insert(lines, work.summary)
+        table.insert(parts, "<h4>" .. _("Summary") .. "</h4>")
+        -- work.summary already has "\n\n" between paragraphs and single
+        -- "\n" for in-paragraph line breaks (see strip_summary_html() in
+        -- ao3client.lua) -- turn each into its own <p>, with <br> for the
+        -- line breaks within one, rather than one <p> HTML would silently
+        -- collapse all that whitespace back out of.
+        for paragraph in (work.summary .. "\n\n"):gmatch("(.-)\n\n") do
+            if paragraph ~= "" then
+                table.insert(parts, "<p>" .. escapeHtml(paragraph):gsub("\n", "<br>") .. "</p>")
+            end
+        end
     end
 
-    table.insert(lines, "")
-    table.insert(lines, work.url)
+    table.insert(parts, "<p><a href=\"" .. escapeHtml(work.url) .. "\">" .. escapeHtml(work.url) .. "</a></p>")
 
-    return table.concat(lines, "\n")
+    return table.concat(parts)
+end
+
+--- The folder a given work's file would be saved into: the configured
+--- download folder, plus a series-named subfolder if that's turned on and
+--- the work actually has a series (first one, if it's in several -- see
+--- ao3client.lua's extract_series()).
+-- @param work table
+-- @return string
+local function downloadDirFor(work)
+    local dir = getDownloadDir()
+    if getUseSeriesFolders() and work.series and #work.series > 0 then
+        dir = dir .. "/" .. util.getSafeFilename(work.series[1].name, dir)
+    end
+    return dir
+end
+
+--[[--
+Writes already-downloaded bytes to disk under downloadDirFor(work), asking
+before overwriting an existing file (matching the convention KOReader's own
+OPDS plugin uses for the same situation). Creates the destination folder
+(and any series subfolder) if it doesn't exist yet.
+
+@param work table
+@param url string  the download URL bytes came from, from getDownloadUrl()
+  -- used only to derive the filename, not fetched again here
+@param bytes string  raw file content, from AO3Client:downloadFile()
+]]
+function AO3Reader:saveDownloadedFile(work, url, bytes)
+    local dir = downloadDirFor(work)
+    local ok, mkdir_err = util.makePath(dir)
+    if not ok then
+        UIManager:show(InfoMessage:new({
+            text = T(_("Could not create folder %1: %2"), dir, mkdir_err),
+        }))
+        return
+    end
+
+    local filename = util.getSafeFilename(AO3Client.filenameFromDownloadUrl(url), dir)
+    local path = dir .. "/" .. filename
+
+    local function write()
+        local file, open_err = io.open(path, "wb")
+        if not file then
+            UIManager:show(InfoMessage:new({ text = T(_("Could not save file: %1"), open_err) }))
+            return
+        end
+        file:write(bytes)
+        file:close()
+
+        UIManager:show(InfoMessage:new({ text = T(_("Saved to %1"), path), timeout = 3 }))
+
+        -- Only present when this plugin's menu was opened from the file
+        -- browser, not from inside a book's own reader menu.
+        if self.ui.file_chooser then
+            self.ui.file_chooser:refreshPath()
+        end
+    end
+
+    if lfs.attributes(path) then
+        UIManager:show(ConfirmBox:new({
+            text = T(_("%1 already exists. Overwrite?"), path),
+            ok_text = _("Overwrite"),
+            ok_callback = write,
+        }))
+    else
+        write()
+    end
+end
+
+--[[--
+Fetches a work's download link for one format and saves it. Two blocking
+network calls in a row (getDownloadUrl() fetches the work page,
+downloadFile() fetches the actual file), each with its own loading message
+since they can each take a moment.
+
+@param work table
+@param format string  one of DOWNLOAD_FORMATS
+]]
+function AO3Reader:downloadWork(work, format)
+    NetworkMgr:runWhenOnline(function()
+        local info = InfoMessage:new({ text = T(_("Finding %1 download link…"), format) })
+        UIManager:show(info)
+        UIManager:forceRePaint()
+
+        local url, find_err = self.ao3:getDownloadUrl(work.id, format)
+        UIManager:close(info)
+        if not url then
+            UIManager:show(InfoMessage:new({ text = T(_("Could not download: %1"), find_err) }))
+            return
+        end
+
+        info = InfoMessage:new({ text = _("Downloading…") })
+        UIManager:show(info)
+        UIManager:forceRePaint()
+
+        local bytes, download_err = self.ao3:downloadFile(url)
+        UIManager:close(info)
+        if not bytes then
+            UIManager:show(InfoMessage:new({ text = T(_("Could not download: %1"), download_err) }))
+            return
+        end
+
+        self:saveDownloadedFile(work, url, bytes)
+    end)
+end
+
+--- Shows one button per available format; tapping one downloads and saves
+--- the work in that format. The currently configured destination folder is
+--- shown in the title so it's visible before committing to a download --
+--- changing it lives in "Download settings" (see addToMainMenu()), not here.
+-- @param work table
+function AO3Reader:showDownloadDialog(work)
+    local dialog
+    local function formatButton(format)
+        return {
+            text = format,
+            callback = function()
+                UIManager:close(dialog)
+                self:downloadWork(work, format)
+            end,
+        }
+    end
+
+    local rows = {}
+    for i = 1, #DOWNLOAD_FORMATS, 2 do
+        local row = { formatButton(DOWNLOAD_FORMATS[i]) }
+        if DOWNLOAD_FORMATS[i + 1] then
+            table.insert(row, formatButton(DOWNLOAD_FORMATS[i + 1]))
+        end
+        table.insert(rows, row)
+    end
+    table.insert(rows, {
+        {
+            text = _("Cancel"),
+            callback = function()
+                UIManager:close(dialog)
+            end,
+        },
+    })
+
+    dialog = ButtonDialog:new({
+        title = T(_("Download “%1”\n\nSave to: %2"), work.title, downloadDirFor(work)),
+        buttons = rows,
+    })
+    UIManager:show(dialog)
 end
 
 --[[--
 Fetches a work listing and shows it as a Menu, tapping an entry shows its
 full AO3-style details (rating, warnings, tags, summary, word/chapter
-counts) in a scrollable TextViewer -- downloading isn't implemented yet
-(see AO3Client:getDownloadUrl()), the work's URL is included in that view
-as the closest substitute for now. Shared by showMarkedForLater() and
-showMyWorks(), which differ only in the fetch function, the loading
-message, and the screen title.
+counts) in a scrollable TextViewer, with a Download button that opens
+showDownloadDialog(). Shared by showMarkedForLater() and showMyWorks(),
+which differ only in the fetch function, the loading message, and the
+screen title.
 
 @param loading_text string  shown (with a forced repaint) before the
   blocking fetch call, so the screen doesn't look frozen while it runs
@@ -223,15 +443,31 @@ function AO3Reader:showWorkListing(loading_text, empty_text, error_prefix, menu_
         end
 
         local item_table = {}
-        for _, work in ipairs(works) do
+        for _idx, work in ipairs(works) do
             table.insert(item_table, {
                 text = work.title .. " — " .. work.author,
                 callback = function()
-                    UIManager:show(TextViewer:new({
+                    local viewer
+                    viewer = TextViewer:new({
                         title = work.title,
                         title_multilines = true,
                         text = formatWorkDetails(work),
-                    }))
+                        text_format = "html",
+                        text_type = "book_info",
+                        add_default_buttons = true,
+                        buttons_table = {
+                            {
+                                {
+                                    text = _("Download"),
+                                    callback = function()
+                                        UIManager:close(viewer)
+                                        self:showDownloadDialog(work)
+                                    end,
+                                },
+                            },
+                        },
+                    })
+                    UIManager:show(viewer)
                 end,
             })
         end
@@ -384,6 +620,34 @@ function AO3Reader:addToMainMenu(menu_items)
         callback = function()
             self:showSearchDialog()
         end,
+    }
+
+    menu_items.ao3_download_settings = {
+        text = _("Download settings"),
+        sub_item_table = {
+            {
+                text_func = function()
+                    return T(_("Download folder: %1"), getDownloadDir())
+                end,
+                -- ui/downloadmgr is KOReader's own folder-picker widget --
+                -- the same one used for e.g. the OPDS plugin's own download
+                -- folder setting.
+                callback = function()
+                    require("ui/downloadmgr"):new({
+                        onConfirm = function(path)
+                            G_reader_settings:saveSetting("ao3_download_dir", path)
+                        end,
+                    }):chooseDir(getDownloadDir())
+                end,
+            },
+            {
+                text = _("Organize into series folders"),
+                checked_func = getUseSeriesFolders,
+                callback = function()
+                    G_reader_settings:saveSetting("ao3_use_series_folders", not getUseSeriesFolders())
+                end,
+            },
+        },
     }
 end
 

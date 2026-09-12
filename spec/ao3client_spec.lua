@@ -22,13 +22,6 @@ describe("AO3Client", function()
         local client = AO3Client.new()
         assert.is_nil(client.session_cookie)
     end)
-
-    it("raises until getDownloadUrl() is actually implemented", function()
-        local client = AO3Client.new()
-        assert.has_error(function()
-            client:getDownloadUrl(12345, "EPUB")
-        end)
-    end)
 end)
 
 describe("AO3Client#login", function()
@@ -1020,6 +1013,300 @@ describe("parse_work_listing rich metadata (rating, warnings, tags, summary, cha
         assert.are.same(
             { "Graphic Depictions Of Violence", "Major Character Death" },
             works[1].warnings
+        )
+    end)
+
+    it("extracts the series a work belongs to", function()
+        -- Real markup from a live browse page, trimmed.
+        local page = [[
+            <ol class="work index group">
+            <li id="work_1" class="work blurb group work-1">
+              <h4 class="heading"><a href="/works/1">A Series Fic</a></h4>
+              <h6 class="landmark heading">Series</h6>
+              <ul class="series">
+                <li>
+                  Part <strong>1</strong> of <a href="/series/6332816">World of Vita Mortis</a>
+                </li>
+              </ul>
+            </li>
+            </ol>
+        ]]
+        local client = AO3Client.new(fake_http({
+            { ok = 1, status = 200, body = page },
+        }))
+
+        local works = client:search("test")
+
+        assert.are.same({
+            { part = 1, name = "World of Vita Mortis", url = "https://archiveofourown.org/series/6332816" },
+        }, works[1].series)
+    end)
+
+    it("collects more than one series when a work belongs to several", function()
+        -- AO3 lets a work belong to more than one series -- inferred from
+        -- the same confirmed one-<li>-per-entry pattern as tags/warnings,
+        -- not independently observed with a real multi-series work.
+        local page = [[
+            <ol class="work index group">
+            <li id="work_1" class="work blurb group work-1">
+              <h4 class="heading"><a href="/works/1">A Multi-Series Fic</a></h4>
+              <ul class="series">
+                <li>Part <strong>1</strong> of <a href="/series/111">First Series</a></li>
+                <li>Part <strong>3</strong> of <a href="/series/222">Second Series</a></li>
+              </ul>
+            </li>
+            </ol>
+        ]]
+        local client = AO3Client.new(fake_http({
+            { ok = 1, status = 200, body = page },
+        }))
+
+        local works = client:search("test")
+
+        assert.are.equal(2, #works[1].series)
+        assert.are.equal("First Series", works[1].series[1].name)
+        assert.are.equal(3, works[1].series[2].part)
+        assert.are.equal("Second Series", works[1].series[2].name)
+    end)
+
+    it("returns an empty list, not nil, when a work isn't part of a series", function()
+        local client = AO3Client.new(fake_http({
+            { ok = 1, status = 200, body = RICH_SAMPLE_PAGE },
+        }))
+
+        local works = client:search("test")
+
+        assert.are.same({}, works[1].series)
+    end)
+end)
+
+describe("AO3Client#getDownloadUrl", function()
+    -- Real "Download" dropdown markup from a live work page, trimmed --
+    -- confirms AO3 lists AZW3 alongside the four documented formats, and
+    -- that each format's own uppercase label (not the file extension) is
+    -- what's actually next to its link.
+    local WORK_PAGE = [[
+        <li class="download">
+          <ul>
+            <li><a href="/downloads/6090505/TEST_TEST_TEST.azw3?updated_at=1456209625">AZW3</a></li>
+            <li><a href="/downloads/6090505/TEST_TEST_TEST.epub?updated_at=1456209625">EPUB</a></li>
+            <li><a href="/downloads/6090505/TEST_TEST_TEST.mobi?updated_at=1456209625">MOBI</a></li>
+            <li><a href="/downloads/6090505/TEST_TEST_TEST.pdf?updated_at=1456209625">PDF</a></li>
+            <li><a href="/downloads/6090505/TEST_TEST_TEST.html?updated_at=1456209625">HTML</a></li>
+          </ul>
+        </li>
+    ]]
+
+    it("fails fast without making any HTTP call when work id is missing", function()
+        local client = AO3Client.new(function()
+            error("should not have made an HTTP call")
+        end)
+
+        local url, err = client:getDownloadUrl(nil, "EPUB")
+
+        assert.is_nil(url)
+        assert.is_not_nil(err)
+    end)
+
+    it("fails fast without making any HTTP call when format is missing", function()
+        local client = AO3Client.new(function()
+            error("should not have made an HTTP call")
+        end)
+
+        local url, err = client:getDownloadUrl(6090505, "")
+
+        assert.is_nil(url)
+        assert.is_not_nil(err)
+    end)
+
+    it("returns the real EPUB link, query string and all", function()
+        local client = AO3Client.new(fake_http({
+            { ok = 1, status = 200, body = WORK_PAGE },
+        }))
+
+        local url, err = client:getDownloadUrl(6090505, "EPUB")
+
+        assert.is_nil(err)
+        assert.are.equal(
+            "https://archiveofourown.org/downloads/6090505/TEST_TEST_TEST.epub?updated_at=1456209625",
+            url
+        )
+    end)
+
+    it("matches the format case-insensitively", function()
+        local client = AO3Client.new(fake_http({
+            { ok = 1, status = 200, body = WORK_PAGE },
+        }))
+
+        local url, err = client:getDownloadUrl(6090505, "epub")
+
+        assert.is_nil(err)
+        assert.matches("%.epub%?", url)
+    end)
+
+    it("finds each of the other formats too", function()
+        local client = AO3Client.new(fake_http({
+            { ok = 1, status = 200, body = WORK_PAGE },
+            { ok = 1, status = 200, body = WORK_PAGE },
+            { ok = 1, status = 200, body = WORK_PAGE },
+            { ok = 1, status = 200, body = WORK_PAGE },
+        }))
+
+        assert.matches("%.azw3%?", (client:getDownloadUrl(6090505, "AZW3")))
+        assert.matches("%.mobi%?", (client:getDownloadUrl(6090505, "MOBI")))
+        assert.matches("%.pdf%?", (client:getDownloadUrl(6090505, "PDF")))
+        assert.matches("%.html%?", (client:getDownloadUrl(6090505, "HTML")))
+    end)
+
+    it("fetches the work's own page, sending whatever cookies are known", function()
+        local captured_opts
+        local client = AO3Client.new(function(opts)
+            captured_opts = opts
+            return 1, 200, {}, WORK_PAGE
+        end)
+        client.session_cookie = "_otwarchive_session=abc123"
+
+        client:getDownloadUrl(6090505, "EPUB")
+
+        assert.are.equal("https://archiveofourown.org/works/6090505", captured_opts.url)
+        assert.are.equal("_otwarchive_session=abc123", captured_opts.headers.Cookie)
+    end)
+
+    it("works before login() has ever been called", function()
+        local client = AO3Client.new(fake_http({
+            { ok = 1, status = 200, body = WORK_PAGE },
+        }))
+
+        local url, err = client:getDownloadUrl(6090505, "EPUB")
+
+        assert.is_nil(err)
+        assert.is_not_nil(url)
+    end)
+
+    it("fails with a clear error when the format has no link on the page", function()
+        -- E.g. a login-restricted or adult-content-gated work fetched
+        -- without a working session: the page comes back fine (200), it
+        -- just doesn't have the Download dropdown this work_id doesn't
+        -- have visible to this requester.
+        local client = AO3Client.new(fake_http({
+            { ok = 1, status = 200, body = "<p>This work is only visible to registered users.</p>" },
+        }))
+
+        local url, err = client:getDownloadUrl(6090505, "EPUB")
+
+        assert.is_nil(url)
+        assert.is_not_nil(err)
+    end)
+
+    it("fails on a non-200 response", function()
+        local client = AO3Client.new(fake_http({
+            { ok = 1, status = 404, body = "" },
+        }))
+
+        local url, err = client:getDownloadUrl(999999999, "EPUB")
+
+        assert.is_nil(url)
+        assert.is_not_nil(err)
+    end)
+
+    it("fails cleanly when the request itself fails", function()
+        local client = AO3Client.new(fake_http({
+            { ok = nil, status = "connection refused" },
+        }))
+
+        local url, err = client:getDownloadUrl(6090505, "EPUB")
+
+        assert.is_nil(url)
+        assert.is_not_nil(err)
+    end)
+end)
+
+describe("AO3Client#downloadFile", function()
+    it("fails fast without making any HTTP call when the url is missing", function()
+        local client = AO3Client.new(function()
+            error("should not have made an HTTP call")
+        end)
+
+        local bytes, err = client:downloadFile("")
+
+        assert.is_nil(bytes)
+        assert.is_not_nil(err)
+    end)
+
+    it("returns the raw response body", function()
+        local client = AO3Client.new(fake_http({
+            { ok = 1, status = 200, body = "\0PK\3\4 not really a zip but has arbitrary bytes \255\254" },
+        }))
+
+        local bytes, err = client:downloadFile("https://archiveofourown.org/downloads/1/Fic.epub")
+
+        assert.is_nil(err)
+        assert.are.equal("\0PK\3\4 not really a zip but has arbitrary bytes \255\254", bytes)
+    end)
+
+    it("sends whatever cookies are already known", function()
+        local captured_opts
+        local client = AO3Client.new(function(opts)
+            captured_opts = opts
+            return 1, 200, {}, "filebytes"
+        end)
+        client.session_cookie = "_otwarchive_session=abc123"
+
+        client:downloadFile("https://archiveofourown.org/downloads/1/Fic.epub")
+
+        assert.are.equal(
+            "https://archiveofourown.org/downloads/1/Fic.epub",
+            captured_opts.url
+        )
+        assert.are.equal("_otwarchive_session=abc123", captured_opts.headers.Cookie)
+    end)
+
+    it("fails on a non-200 response", function()
+        local client = AO3Client.new(fake_http({
+            { ok = 1, status = 404, body = "" },
+        }))
+
+        local bytes, err = client:downloadFile("https://archiveofourown.org/downloads/1/Fic.epub")
+
+        assert.is_nil(bytes)
+        assert.is_not_nil(err)
+    end)
+
+    it("fails cleanly when the request itself fails", function()
+        local client = AO3Client.new(fake_http({
+            { ok = nil, status = "connection refused" },
+        }))
+
+        local bytes, err = client:downloadFile("https://archiveofourown.org/downloads/1/Fic.epub")
+
+        assert.is_nil(bytes)
+        assert.is_not_nil(err)
+    end)
+end)
+
+describe("AO3Client.filenameFromDownloadUrl", function()
+    it("takes the last path segment and drops the query string", function()
+        assert.are.equal(
+            "TEST_TEST_TEST.epub",
+            AO3Client.filenameFromDownloadUrl(
+                "https://archiveofourown.org/downloads/6090505/TEST_TEST_TEST.epub?updated_at=1456209625"
+            )
+        )
+    end)
+
+    it("percent-decodes the filename", function()
+        assert.are.equal(
+            "My Fic (Remix).epub",
+            AO3Client.filenameFromDownloadUrl(
+                "https://archiveofourown.org/downloads/1/My%20Fic%20%28Remix%29.epub"
+            )
+        )
+    end)
+
+    it("works with no query string at all", function()
+        assert.are.equal(
+            "Test-test.epub",
+            AO3Client.filenameFromDownloadUrl("https://archiveofourown.org/downloads/1/Test-test.epub")
         )
     end)
 end)

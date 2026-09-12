@@ -47,7 +47,19 @@ local MenuSetup = {}
 local ORDER_CONFIG_PREFIXES = { "reader", "filemanager" }
 
 local TAB_ID = "ao3reader"
-local TAB_ITEM_IDS = { "ao3_account", "ao3_marked_for_later", "ao3_search" }
+-- The dashed-string entry is a real, existing KOReader convention for a
+-- visual divider inside an item list -- confirmed throughout KOReader's own
+-- menu definitions (e.g. ui/elements/filemanager_menu_order.lua's own
+-- "setting"/"device"/"navigation" entries), not invented here. Splits the
+-- tab into the two things it now holds: things you *do* (browse/search),
+-- and how downloads are configured.
+local TAB_ITEM_IDS = {
+    "ao3_account",
+    "ao3_marked_for_later",
+    "ao3_search",
+    "----------------------------",
+    "ao3_download_settings",
+}
 local ICON_NAME = "ao3"
 
 --[[--
