@@ -88,9 +88,36 @@ markup. Design notes for whoever picks this up:
 
 Not yet implemented: `search()`, `getDownloadUrl()`.
 
-Next session: run `busted` for real inside WSL to confirm the 5 new
-`getMarkedForLater()` tests actually pass (traced by hand, not executed —
-same caveat as before), then run the plugin for real (KOReader emulator, or
-a small throwaway script like `smoke_test_login.lua`) against an account
-that actually has something in Marked for Later, to check the parsed
-titles/authors match reality. Only after that move on to `search()`.
+`main.lua` now has real UI, not just menu stubs: "Log in to AO3" (a
+`MultiInputDialog` with username + password fields), "Log out", and
+"Marked for Later" (fetches the real list and shows it as a `Menu` —
+tapping a work currently just shows its AO3 URL in an `InfoMessage`, since
+there's nothing to download yet). "Search AO3" is still an empty stub —
+`AO3Client:search()` doesn't exist yet to call. The menu's `sorting_hint`
+is now `"tools"`, so it's under KOReader's top-level Tools menu instead of
+buried in Search, for faster access while testing.
+
+Design notes on the UI layer:
+- One `AO3Client` instance lives on the plugin for its whole lifetime
+  (`self.ao3`, created in `init()`). Nothing is persisted to disk yet —
+  logging in again is currently the only way to get a session back after a
+  KOReader restart. Persisting `session_cookie` + username (never the
+  password) via `G_reader_settings` is a reasonable follow-up.
+- Both the login call and the Marked for Later fetch are wrapped in
+  `NetworkMgr:runWhenOnline(...)`, so they wait for Wi-Fi instead of
+  failing outright when it's off (the normal state on a Kindle to save
+  battery) — this matters much more on a real Kindle than in the WSL
+  emulator, where networking is already up.
+- None of `main.lua` is covered by the busted suite — it's all real
+  KOReader widgets (`MultiInputDialog`, `Menu`, `InfoMessage`,
+  `NetworkMgr`), which only exist inside a running KOReader. Verifying it
+  means actually running the emulator or a device, not `busted`.
+
+Next session: with the emulator running (symlink `ao3.koplugin` into
+`koreader/plugins/`, per docs/SETUP.md), check the Tools menu shows "AO3
+Reader", try "Log in to AO3" with real credentials, then "Marked for
+Later" — this is also the first real, end-to-end check of
+`getMarkedForLater()`'s HTML parsing against the live site (still
+unverified per the note above). If titles/authors look right, move on to
+`search()`; if not, the parsing assumptions in `ao3client.lua` are the
+first thing to revisit.
