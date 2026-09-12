@@ -337,7 +337,8 @@ function AO3Client:fetchWorkListing(url, fallback_author)
         return nil, "unexpected response (" .. tostring(status) .. ") — the session may have expired, try login() again"
     end
     if looks_like_login_page(body) then
-        return nil, "AO3 sent back the login page instead of your results — the session has likely expired, log in again"
+        return nil, "AO3 sent back the login page instead of your results — "
+            .. "the session has likely expired, log in again"
     end
 
     return parse_work_listing(body, fallback_author)
