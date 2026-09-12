@@ -126,7 +126,41 @@ busted
 luacheck .
 ```
 
-## 5. Pushing to GitHub
+## 5. (Optional) Claude Code CLI, so Claude can actually run Lua here
+
+The Claude sessions working on this project through Cowork (chat/cloud)
+can't execute Lua at all — the cloud sandbox and the bridge into this
+Windows machine both block package installs and outside network access
+(apt, pip, npm, and direct downloads from lua.org/luarocks.org all get
+refused). Every "not yet verified by busted" caveat in `CLAUDE.md` traces
+back to that: those sessions can read and reason about the code, but
+never actually run it.
+
+Your WSL2 Ubuntu install doesn't have that restriction — it's your own
+machine, with normal internet access. Installing the Claude Code CLI
+*there* gives a Claude session a real shell in this exact environment,
+able to install the toolchain from step 4 above and actually run
+`busted`/`luacheck` itself, not just reason about whether they'd pass.
+
+1. In a WSL2/Ubuntu terminal (not PowerShell):
+   ```bash
+   curl -fsSL https://claude.ai/install.sh | bash
+   ```
+   (npm install works too, but needs Node.js 22+ and doesn't auto-update —
+   the script above is the simpler default.)
+2. Check it installed: `claude --version`
+3. From the repo root: `cd ~/projects/ao3-koreader-plugin && claude` — the
+   first run opens a browser to log in (needs a Claude Pro/Max/Team/
+   Enterprise plan, or a Console API account; the free Claude.ai plan
+   doesn't include CLI access).
+4. Nothing else to set up: Claude Code reads this repo's `CLAUDE.md`
+   automatically on start, so it already has this project's conventions,
+   architecture notes, and current status. Worth asking it, early on, to
+   install the toolchain from step 4 and run `busted`/`luacheck` once —
+   that's the first real confirmation this whole project has had that the
+   test suite actually passes, rather than just reading right by eye.
+
+## 6. Pushing to GitHub
 
 Easiest path, entirely inside VS Code, no terminal needed:
 

@@ -42,7 +42,14 @@ finds works, and fetches the file AO3 already made.
 - Lua target: LuaJIT (`std = "luajit"` in `.luacheckrc`), matching
   KOReader itself.
 - Run `luacheck .` and `busted` before committing (docs/SETUP.md has the
-  commands; run them inside WSL2/Ubuntu).
+  commands; run them inside WSL2/Ubuntu). Note for whichever Claude session
+  is reading this: if that's you inside a Cowork chat/cloud session, you
+  almost certainly *can't* actually run these — both the cloud sandbox and
+  the bridge into this Windows machine block package installs and outside
+  network access, which is why so much of this file says "not yet verified
+  by busted" instead of just "passes". A Claude Code CLI session started
+  from inside the WSL2 terminal itself has real internet access and can
+  actually run them — see docs/SETUP.md's "Claude Code CLI" section.
 - Unit tests never make real HTTP requests — stub/mock the network layer.
   Anything that needs a live AO3 response gets checked by hand on-device
   or in the desktop emulator.
