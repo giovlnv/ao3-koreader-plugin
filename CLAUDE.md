@@ -53,32 +53,44 @@ finds works, and fetches the file AO3 already made.
 
 ## Status
 
-`login()` is implemented and unit-tested (7 tests, all mocked — no network
-call is ever made in the suite). Design notes for whoever picks this up:
+`login()` is implemented, unit-tested, **and confirmed working against the
+real archiveofourown.org** (verified with `scripts/smoke_test_login.lua`).
+The field names documented in `ao3client.lua` are correct as of this check.
+
+`getMarkedForLater()` is implemented and unit-tested (5 more tests, all
+mocked) but **not yet verified against the real site** — unlike login, its
+HTML parsing was designed from secondary sources (other AO3 tools'
+selectors), not from directly inspecting a real "Marked for Later" page's
+markup. Design notes for whoever picks this up:
 
 - `AO3Client.new(http_request)` takes an optional HTTP function so tests can
   inject a fake transport; the real one (`default_http_request`, using
   `ssl.https` + `ltn12`) is only `require`d lazily, so running the tests
   doesn't need LuaSec installed at all.
-- The login flow does a GET (to pull the CSRF token AO3's Rails app embeds
-  as a `<meta name="csrf-token">` tag) then a POST with
-  `authenticity_token` + `user[login]` + `user[password]`. Those three
-  field names are confirmed against a currently-published unofficial AO3
-  client library, not against AO3 itself — **not yet verified against the
-  real site**. If a real login attempt fails with "login rejected" despite
-  correct credentials, re-check the login page's actual form field names
-  first.
 - Cookie extraction deliberately doesn't do general cookie parsing: it
   pattern-matches for `_otwarchive_session=...` specifically, to sidestep a
   known LuaSocket gotcha where repeated `Set-Cookie` headers get
   comma-joined and cookie expiry dates (which contain commas) mangle the
   result.
+- There's no HTML/DOM library available to a plain KOReader Lua plugin, so
+  `getMarkedForLater()` parses with plain string patterns. `split_work_blurbs()`
+  anchors on `id="work_<id>" class="...blurb..."`, which several independent
+  AO3 tools agree is how every work-listing page marks up one entry, then
+  slices the page "up to the next work's id" rather than trying to find a
+  matching closing `</li>` (nested `<li>`s inside a work's tags make that
+  unreliable with plain patterns). Only page 1 is read — AO3 paginates this
+  list, and later pages are a follow-up, not done yet.
+- If real works come back with a wrong/empty title or "Anonymous" for an
+  author who does have one, that's the first place to look: the `<h4>`
+  title/author markup was inferred from other tools' code, not seen
+  directly, the same caveat login's field names had before being checked
+  for real.
 
-Not yet implemented: `getMarkedForLater()`, `search()`, `getDownloadUrl()`.
+Not yet implemented: `search()`, `getDownloadUrl()`.
 
-Next session: run `busted` for real inside WSL to confirm the mocked tests
-actually pass (they've only been traced by hand so far, not executed —
-see if there's anything Lua-syntax-wise that doesn't hold up), then do one
-real login attempt against archiveofourown.org (from the KOReader emulator
-or a throwaway script) to confirm the field names above are still correct.
-Only after that move on to `getMarkedForLater()`.
+Next session: run `busted` for real inside WSL to confirm the 5 new
+`getMarkedForLater()` tests actually pass (traced by hand, not executed —
+same caveat as before), then run the plugin for real (KOReader emulator, or
+a small throwaway script like `smoke_test_login.lua`) against an account
+that actually has something in Marked for Later, to check the parsed
+titles/authors match reality. Only after that move on to `search()`.

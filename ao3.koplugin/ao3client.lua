@@ -38,6 +38,60 @@ local function url_encode(str)
     return str
 end
 
+-- Only the handful of entities that actually show up in fic titles/author
+-- names (ampersands and quotes, mostly). Not a general HTML-entity decoder.
+local HTML_ENTITIES = {
+    ["&amp;"] = "&",
+    ["&lt;"] = "<",
+    ["&gt;"] = ">",
+    ["&quot;"] = '"',
+    ["&#39;"] = "'",
+    ["&apos;"] = "'",
+}
+
+local function html_unescape(str)
+    if not str then
+        return str
+    end
+    return (str:gsub("&#?%w+;", function(entity)
+        return HTML_ENTITIES[entity] or entity
+    end))
+end
+
+--[[--
+Splits a listing page's body into one chunk per work, anchored on
+`id="work_<id>"` — confirmed, across several independent AO3 tools, to be
+how every work-listing page (search results, bookmarks, reading lists)
+marks up each entry. Deliberately does NOT try to find the matching closing
+`</li>`: AO3's markup nests other `<li>` elements inside a work's own block
+(for tags, warnings, etc.), which plain pattern matching can't balance
+correctly. Slicing "up to the next work's id" instead sidesteps that
+entirely, at the cost of not knowing exactly where one work's HTML ends —
+harmless here since we only ever search forward for specific fields.
+
+@param body string  the page's HTML
+@return { {id = string, html = string}, ... }
+]]
+local function split_work_blurbs(body)
+    local markers = {}
+    local search_from = 1
+    while true do
+        local start_pos, end_pos, work_id = body:find('id="work_(%d+)" class="[^"]-blurb', search_from)
+        if not start_pos then
+            break
+        end
+        table.insert(markers, { id = work_id, start = start_pos })
+        search_from = end_pos + 1
+    end
+
+    local blurbs = {}
+    for i, marker in ipairs(markers) do
+        local chunk_end = (markers[i + 1] and markers[i + 1].start - 1) or #body
+        table.insert(blurbs, { id = marker.id, html = body:sub(marker.start, chunk_end) })
+    end
+    return blurbs
+end
+
 --[[--
 Does the actual HTTP work, using KOReader/LuaJIT's bundled LuaSec. Kept as a
 plain function (not a method, no upvalues into AO3Client) so a test can pass
@@ -146,17 +200,63 @@ function AO3Client:login(username, password)
     end
 
     self.session_cookie = SESSION_COOKIE_NAME .. "=" .. session_value
+    self.username = username
     return true
 end
 
---- Returns the works on the user's "Marked for Later" list. Requires a
---- prior successful login().
--- @return table[]? works  list of { id, title, author, fandom, url }
--- @return string? err
+--[[--
+Returns the works on the user's "Marked for Later" list. Requires a prior
+successful login() (needs both the session cookie and the username, to
+build the URL).
+
+Only reads page 1 — AO3 paginates this list, and going past page 1 is left
+for a later session (see CLAUDE.md).
+
+@return table[]? works  list of { id, title, author, url }, most-recent first
+@return string? err
+]]
 function AO3Client:getMarkedForLater()
-    -- TODO: GET BASE_URL .. "/users/<username>/readings?show=to-read",
-    -- sending Cookie: self.session_cookie
-    error("not implemented yet")
+    if not self.session_cookie or not self.username then
+        return nil, "not logged in"
+    end
+
+    local ok, status, _, body = self.http_request({
+        url = BASE_URL .. "/users/" .. url_encode(self.username) .. "/readings?show=to-read",
+        method = "GET",
+        headers = { Cookie = self.session_cookie },
+    })
+    if not ok then
+        return nil, "could not reach AO3 (" .. tostring(status) .. ")"
+    end
+    if status ~= 200 then
+        return nil, "unexpected response (" .. tostring(status) .. ") — the session may have expired, try login() again"
+    end
+
+    local works = {}
+    for _, blurb in ipairs(split_work_blurbs(body)) do
+        -- Anchor the title link to this specific work's id, not just "the
+        -- first /works/ link", since a blurb can also link to a series or
+        -- a related work before its own title in some layouts.
+        local title = blurb.html:match('href="/works/' .. blurb.id .. '"[^>]*>([^<]+)</a>')
+        if title then
+            local authors = {}
+            for author in blurb.html:gmatch('rel="author"[^>]*>([^<]+)</a>') do
+                table.insert(authors, html_unescape(author))
+            end
+
+            table.insert(works, {
+                id = blurb.id,
+                title = html_unescape(title),
+                author = #authors > 0 and table.concat(authors, ", ") or "Anonymous",
+                url = BASE_URL .. "/works/" .. blurb.id,
+            })
+        end
+        -- A blurb whose title we couldn't find is silently skipped rather
+        -- than failing the whole list — better to show 19 of 20 works than
+        -- none, if AO3's markup has a variant we didn't account for.
+    end
+
+    return works
 end
 
 --- Searches AO3 works by free-text query.

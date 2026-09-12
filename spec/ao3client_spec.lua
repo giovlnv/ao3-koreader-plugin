@@ -144,3 +144,119 @@ describe("AO3Client#login", function()
         assert.is_not_nil(err)
     end)
 end)
+
+describe("AO3Client#getMarkedForLater", function()
+    -- getMarkedForLater() only needs the state login() would have set; skip
+    -- re-running a fake login handshake in every test and just set it directly.
+    local function logged_in_client(http_request)
+        local client = AO3Client.new(http_request)
+        client.session_cookie = "_otwarchive_session=abc123"
+        client.username = "someuser"
+        return client
+    end
+
+    -- A trimmed-down but structurally real reading-list page: two works,
+    -- one with a normal author, one anonymous with an HTML entity in its
+    -- title — both things that show up in real AO3 listings.
+    local SAMPLE_PAGE = [[
+        <ol class="reading work index group">
+        <li id="work_111" class="reading work blurb group work-111">
+          <h4 class="heading">
+            <a href="/works/111">A Very Good Fic</a>
+            by
+            <a rel="author" href="/users/someauthor/pseuds/someauthor">someauthor</a>
+          </h4>
+          <h5 class="fandoms heading">
+            <a class="tag" href="/tags/Some%20Fandom/works">Some Fandom</a>
+          </h5>
+        </li>
+        <li id="work_222" class="reading work blurb group work-222">
+          <h4 class="heading">
+            <a href="/works/222">Another Fic &amp; Friends</a>
+          </h4>
+        </li>
+        </ol>
+    ]]
+
+    it("fails without making a request when not logged in", function()
+        local client = AO3Client.new(function()
+            error("should not have made an HTTP call")
+        end)
+
+        local works, err = client:getMarkedForLater()
+
+        assert.is_nil(works)
+        assert.is_not_nil(err)
+    end)
+
+    it("parses works out of a reading-list page, in order", function()
+        local client = logged_in_client(fake_http({
+            { ok = 1, status = 200, body = SAMPLE_PAGE },
+        }))
+
+        local works, err = client:getMarkedForLater()
+
+        assert.is_nil(err)
+        assert.are.equal(2, #works)
+
+        assert.are.equal("111", works[1].id)
+        assert.are.equal("A Very Good Fic", works[1].title)
+        assert.are.equal("someauthor", works[1].author)
+        assert.are.equal("https://archiveofourown.org/works/111", works[1].url)
+
+        -- entity-decoded title, and no author link -> Anonymous.
+        assert.are.equal("Another Fic & Friends", works[2].title)
+        assert.are.equal("Anonymous", works[2].author)
+    end)
+
+    it("sends the session cookie and builds the URL from the username", function()
+        local captured_opts
+        local client = logged_in_client(function(opts)
+            captured_opts = opts
+            return 1, 200, {}, SAMPLE_PAGE
+        end)
+
+        client:getMarkedForLater()
+
+        assert.are.equal(
+            "https://archiveofourown.org/users/someuser/readings?show=to-read",
+            captured_opts.url
+        )
+        assert.are.equal("_otwarchive_session=abc123", captured_opts.headers.Cookie)
+    end)
+
+    it("returns an empty list, not an error, when there's nothing marked", function()
+        local client = logged_in_client(fake_http({
+            { ok = 1, status = 200, body = "<p>No works here.</p>" },
+        }))
+
+        local works, err = client:getMarkedForLater()
+
+        assert.is_nil(err)
+        assert.are.equal(0, #works)
+    end)
+
+    it("fails when the session looks expired", function()
+        -- A real expired session gets redirected to the login page; a non-200
+        -- status is the simplest reliable signal to check for that here.
+        local client = logged_in_client(fake_http({
+            { ok = 1, status = 403, body = "" },
+        }))
+
+        local works, err = client:getMarkedForLater()
+
+        assert.is_nil(works)
+        assert.is_not_nil(err)
+    end)
+
+    it("fails cleanly when the request itself fails", function()
+        local client = logged_in_client(fake_http({
+            { ok = nil, status = "connection refused" },
+        }))
+
+        local works, err = client:getMarkedForLater()
+
+        assert.is_nil(works)
+        assert.is_not_nil(err)
+    end)
+end)
