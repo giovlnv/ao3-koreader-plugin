@@ -93,13 +93,15 @@ local function split_work_blurbs(body)
 end
 
 --[[--
-Does the actual HTTP work, using KOReader/LuaJIT's bundled LuaSec. Kept as a
-plain function (not a method, no upvalues into AO3Client) so a test can pass
-in a completely different one — see AO3Client.new().
+Does the actual HTTP work, using KOReader/LuaJIT's bundled LuaSec, with
+KOReader's own socketutil timeouts applied so a stalled connection fails
+loudly instead of freezing the UI. Kept as a plain function (not a method,
+no upvalues into AO3Client) so a test can pass in a completely different
+one — see AO3Client.new().
 
-`require("ssl.https")` happens in here rather than at file scope so that
-unit tests, which never call this function, don't need LuaSec installed
-just to run.
+`require(...)` for ssl.https/ltn12/socketutil happens in here rather than at
+file scope so that unit tests, which never call this function, don't need
+LuaSec (or a running KOReader, for socketutil) installed just to run.
 
 @param opts table: { url, method, headers, body }
 @return ok boolean|nil   truthy on a completed request (any HTTP status)
@@ -110,6 +112,20 @@ just to run.
 local function default_http_request(opts)
     local https = require("ssl.https")
     local ltn12 = require("ltn12")
+    local socketutil = require("socketutil")
+
+    -- LuaSec's own timeout (60s, hardcoded into ssl.https.request(), and not
+    -- overridable through its public API — it explicitly rejects a custom
+    -- `create` function) covers the TCP connect and the TLS handshake, but
+    -- nothing after that: a server that trickles back a byte every few
+    -- seconds could otherwise hang the request (and, since this all runs
+    -- synchronously, the whole KOReader UI) indefinitely. socketutil is
+    -- KOReader's own fix for exactly this, used the same way by every other
+    -- online plugin (wallabag, opds, ...): it bounds both a single read
+    -- ("block") and the request as a whole ("total"). It does NOT cover DNS
+    -- resolution — that happens before any socket exists, so a broken
+    -- resolver can still hang past this timeout. See CLAUDE.md.
+    socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
 
     local response_chunks = {}
     local ok, status, headers = https.request({
@@ -119,6 +135,7 @@ local function default_http_request(opts)
         source = opts.body and ltn12.source.string(opts.body) or nil,
         sink = ltn12.sink.table(response_chunks),
     })
+    socketutil:reset_timeout()
 
     return ok, status, headers or {}, table.concat(response_chunks)
 end
@@ -205,33 +222,17 @@ function AO3Client:login(username, password)
 end
 
 --[[--
-Returns the works on the user's "Marked for Later" list. Requires a prior
-successful login() (needs both the session cookie and the username, to
-build the URL).
+Turns a listing page's body into work entries. Shared by getMarkedForLater()
+and getMyWorks(), which are otherwise identical except for the URL they hit
+and what "no author link on the blurb" should fall back to (a Marked for
+Later entry with no author link is really anonymous; a My Works entry with
+no author link is just AO3 omitting "by yourself" — it's still you).
 
-Only reads page 1 — AO3 paginates this list, and going past page 1 is left
-for a later session (see CLAUDE.md).
-
-@return table[]? works  list of { id, title, author, url }, most-recent first
-@return string? err
+@param body string  the page's HTML
+@param fallback_author string  used when a blurb has no `rel="author"` link
+@return table[] works  list of { id, title, author, url }
 ]]
-function AO3Client:getMarkedForLater()
-    if not self.session_cookie or not self.username then
-        return nil, "not logged in"
-    end
-
-    local ok, status, _, body = self.http_request({
-        url = BASE_URL .. "/users/" .. url_encode(self.username) .. "/readings?show=to-read",
-        method = "GET",
-        headers = { Cookie = self.session_cookie },
-    })
-    if not ok then
-        return nil, "could not reach AO3 (" .. tostring(status) .. ")"
-    end
-    if status ~= 200 then
-        return nil, "unexpected response (" .. tostring(status) .. ") — the session may have expired, try login() again"
-    end
-
+local function parse_work_listing(body, fallback_author)
     local works = {}
     for _, blurb in ipairs(split_work_blurbs(body)) do
         -- Anchor the title link to this specific work's id, not just "the
@@ -247,7 +248,7 @@ function AO3Client:getMarkedForLater()
             table.insert(works, {
                 id = blurb.id,
                 title = html_unescape(title),
-                author = #authors > 0 and table.concat(authors, ", ") or "Anonymous",
+                author = #authors > 0 and table.concat(authors, ", ") or fallback_author,
                 url = BASE_URL .. "/works/" .. blurb.id,
             })
         end
@@ -255,8 +256,77 @@ function AO3Client:getMarkedForLater()
         -- than failing the whole list — better to show 19 of 20 works than
         -- none, if AO3's markup has a variant we didn't account for.
     end
-
     return works
+end
+
+--[[--
+Fetches a logged-in-only listing page and turns it into work entries. Shared
+GET/status-check/parse plumbing for getMarkedForLater() and getMyWorks().
+
+@param url string
+@param fallback_author string  passed through to parse_work_listing()
+@return table[]? works
+@return string? err
+]]
+function AO3Client:fetchWorkListing(url, fallback_author)
+    if not self.session_cookie or not self.username then
+        return nil, "not logged in"
+    end
+
+    local ok, status, _, body = self.http_request({
+        url = url,
+        method = "GET",
+        headers = { Cookie = self.session_cookie },
+    })
+    if not ok then
+        return nil, "could not reach AO3 (" .. tostring(status) .. ")"
+    end
+    if status ~= 200 then
+        return nil, "unexpected response (" .. tostring(status) .. ") — the session may have expired, try login() again"
+    end
+
+    return parse_work_listing(body, fallback_author)
+end
+
+--[[--
+Returns the works on the user's "Marked for Later" list. Requires a prior
+successful login() (needs both the session cookie and the username, to
+build the URL).
+
+Only reads page 1 — AO3 paginates this list, and going past page 1 is left
+for a later session (see CLAUDE.md).
+
+@return table[]? works  list of { id, title, author, url }, most-recent first
+@return string? err
+]]
+function AO3Client:getMarkedForLater()
+    -- Checked here too (fetchWorkListing() checks again) so url_encode()
+    -- below never runs on a nil username.
+    if not self.username then
+        return nil, "not logged in"
+    end
+    return self:fetchWorkListing(
+        BASE_URL .. "/users/" .. url_encode(self.username) .. "/readings?show=to-read",
+        "Anonymous"
+    )
+end
+
+--[[--
+Returns the works the logged-in user has posted themselves (AO3's "My
+Works" page). Same pagination caveat as getMarkedForLater(): only page 1.
+
+@return table[]? works  list of { id, title, author, url }, most-recent first
+@return string? err
+]]
+function AO3Client:getMyWorks()
+    -- Same reason as getMarkedForLater(): avoid url_encode(nil) below.
+    if not self.username then
+        return nil, "not logged in"
+    end
+    return self:fetchWorkListing(
+        BASE_URL .. "/users/" .. url_encode(self.username) .. "/works",
+        self.username
+    )
 end
 
 --- Searches AO3 works by free-text query.

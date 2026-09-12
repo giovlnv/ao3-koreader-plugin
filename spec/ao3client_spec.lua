@@ -260,3 +260,118 @@ describe("AO3Client#getMarkedForLater", function()
         assert.is_not_nil(err)
     end)
 end)
+
+describe("AO3Client#getMyWorks", function()
+    -- Same helper as the getMarkedForLater describe block above (kept local
+    -- to each block rather than shared, since busted specs don't share
+    -- upvalues across sibling describe() calls without extra plumbing).
+    local function logged_in_client(http_request)
+        local client = AO3Client.new(http_request)
+        client.session_cookie = "_otwarchive_session=abc123"
+        client.username = "someuser"
+        return client
+    end
+
+    -- Unlike a Marked for Later blurb, a work on your OWN "My Works" page can
+    -- have no `rel="author"` link at all (AO3 just doesn't bother linking
+    -- "by yourself") — that's the one behavioural difference this getter has
+    -- from getMarkedForLater(), so the fixture exercises both: one blurb
+    -- with the author link present, one without.
+    local SAMPLE_PAGE = [[
+        <ol class="work index group">
+        <li id="work_333" class="work blurb group work-333">
+          <h4 class="heading">
+            <a href="/works/333">My First Fic</a>
+            by
+            <a rel="author" href="/users/someuser/pseuds/someuser">someuser</a>
+          </h4>
+        </li>
+        <li id="work_444" class="work blurb group work-444">
+          <h4 class="heading">
+            <a href="/works/444">My Second Fic</a>
+          </h4>
+        </li>
+        </ol>
+    ]]
+
+    it("fails without making a request when not logged in", function()
+        local client = AO3Client.new(function()
+            error("should not have made an HTTP call")
+        end)
+
+        local works, err = client:getMyWorks()
+
+        assert.is_nil(works)
+        assert.is_not_nil(err)
+    end)
+
+    it("parses works out of a works page, in order", function()
+        local client = logged_in_client(fake_http({
+            { ok = 1, status = 200, body = SAMPLE_PAGE },
+        }))
+
+        local works, err = client:getMyWorks()
+
+        assert.is_nil(err)
+        assert.are.equal(2, #works)
+
+        assert.are.equal("333", works[1].id)
+        assert.are.equal("My First Fic", works[1].title)
+        assert.are.equal("someuser", works[1].author)
+
+        -- No author link on this one -> falls back to the logged-in
+        -- username, NOT "Anonymous" (that's the difference from
+        -- getMarkedForLater() this getter exists to cover).
+        assert.are.equal("My Second Fic", works[2].title)
+        assert.are.equal("someuser", works[2].author)
+    end)
+
+    it("sends the session cookie and builds the URL from the username", function()
+        local captured_opts
+        local client = logged_in_client(function(opts)
+            captured_opts = opts
+            return 1, 200, {}, SAMPLE_PAGE
+        end)
+
+        client:getMyWorks()
+
+        assert.are.equal(
+            "https://archiveofourown.org/users/someuser/works",
+            captured_opts.url
+        )
+        assert.are.equal("_otwarchive_session=abc123", captured_opts.headers.Cookie)
+    end)
+
+    it("returns an empty list, not an error, when nothing's been posted", function()
+        local client = logged_in_client(fake_http({
+            { ok = 1, status = 200, body = "<p>No works here.</p>" },
+        }))
+
+        local works, err = client:getMyWorks()
+
+        assert.is_nil(err)
+        assert.are.equal(0, #works)
+    end)
+
+    it("fails when the session looks expired", function()
+        local client = logged_in_client(fake_http({
+            { ok = 1, status = 403, body = "" },
+        }))
+
+        local works, err = client:getMyWorks()
+
+        assert.is_nil(works)
+        assert.is_not_nil(err)
+    end)
+
+    it("fails cleanly when the request itself fails", function()
+        local client = logged_in_client(fake_http({
+            { ok = nil, status = "connection refused" },
+        }))
+
+        local works, err = client:getMyWorks()
+
+        assert.is_nil(works)
+        assert.is_not_nil(err)
+    end)
+end)
